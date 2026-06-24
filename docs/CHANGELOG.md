@@ -10,14 +10,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- 🔍 **Search fallback chain expansion (Bing / Google CSE / DuckDuckGo)** — extend `src/search_service.py` with three new providers (`BingSearchProvider`, `GoogleCSESearchProvider`, `DuckDuckGoSearchProvider`) so that when paid quotas are exhausted (Tavily / SerpAPI etc.) the multi-dimensional intelligence search can still complete. New env vars: `BING_API_KEYS`, `GOOGLE_CSE_API_KEYS`, `GOOGLE_CSE_ENGINE_ID`, `DUCKDUCKGO_ENABLED`. Default `NEWS_SEARCH_SOURCE_PRIORITY` now includes the new providers.
+- 🛡️ **Quota-exhausted circuit breaker for all search providers** — `BaseSearchProvider` now detects quota / rate-limit error fingerprints (e.g. Tavily's `"exceeds your plan's set usage limit"`, HTTP 429, "monthly limit", "out of credits") and trips a per-provider 1-hour cooldown. During the cooldown the provider is reported as unavailable and `SearchService` skips it entirely, eliminating the repeated wasted requests observed in the logs (5 dimensions × N seconds each).
+- 🔄 **Per-dimension fallback in multi-dimensional intelligence search** — `search_comprehensive_intel` now treats the round-robin pick as the *primary* provider for each dimension and automatically falls through to the remaining available providers in priority order on failure, so a single quota error no longer empties an entire dimension when other providers are still healthy.
+- **Tushare chip distribution fallback** — add optional `cyq_perf` support for chip distribution when `TUSHARE_TOKEN` has the required permission, mapping winner rate and cost percentiles into the existing `ChipDistribution` model before falling back to AkShare.
+- **JoinQuant local backtest data source** — add optional `QUANT_BACKTEST_DATA_SOURCE=joinquant` mode backed by `jqdatasdk`, so local vectorbt backtests can use JoinQuant historical daily bars without replacing the default AKShare source.
+- 🛠️ **筹码分布缓存兜底** — 成功抓取筹码分布后写入本地缓存，外部接口全部失败时自动使用最近有效缓存，并通过 `CHIP_DISTRIBUTION_CACHE_TTL_DAYS` 控制有效期，避免接口波动导致筹码字段长期缺失
+- **AkShare + vectorbt local backtest MVP** — add standalone daily data fetcher, MA crossover backtest, single-stock report generator, MA parameter search, sample stock pool, and local output directories for exploratory A-share backtesting.
+- **Single-command local backtest runner** — add `src/run_analysis.py` to fetch data once, generate the MA report, and export MA parameter search results in one command.
+- **Strategy backtest summary service** — add `StrategyBacktestService` to produce a standard JSON summary for downstream report rendering, WebUI, notification, and AI interpretation.
+- **Stock pool strategy backtest runner** — add `src/run_stock_pool_backtest.py` to run `StrategyBacktestService` for symbols in `stock_pool.txt` and export stock-pool-level CSV/JSON summaries with per-symbol error handling.
+- **Per-symbol stock pool backtest dates** — allow `stock_pool.txt` lines in `symbol,start_date,end_date` format for newly listed stocks or ETFs that need a different historical window.
+- **Quant backtest report context** — load stock-pool backtest summaries into report renderer templates and add a preview command for quant report rendering.
+- **ETF backtest data fallback** — support suffixed symbols such as `159115.SZ` and ETF historical data fallback via AKShare Sina ETF history when Eastmoney is unavailable.
+- **Optional quant prompt context** — add `QUANT_BACKTEST_PROMPT_ENABLED` and `QUANT_BACKTEST_SUMMARY_PATH` to inject vectorbt backtest summaries into the LLM prompt so AI advice can account for strategy performance and risk constraints.
+- **Decision toolchain feature flags** — add disabled-by-default env switches for local quant auto-run, cloud backtest summaries, local/cloud comparison, decision rules, and decision reports while preserving the existing `.env`-driven main entrypoint.
+- **Quant summary preparation in main flow** — when `QUANT_BACKTEST_ENABLED=true`, `main.py` now checks the local quant summary before stock analysis and can auto-generate it when `QUANT_BACKTEST_AUTO_RUN=true`.
+- **Decision rule guardrails** — add disabled-by-default hard guardrails that inject conservative constraints into LLM prompts and downgrade overly aggressive buy advice when local quant risk rules are triggered.
+- **JoinQuant cloud backtest export** — add a manual cloud validation CLI that exports JoinQuant MA crossover scripts from the local stock pool and writes a `cloud_backtest_summary.json` fill-in template without calling external data sources.
+- **Local/cloud backtest comparison** — add a non-blocking comparison CLI that checks strategy return, benchmark return, drawdown, trade-count differences, and benchmark direction consistency between local vectorbt and cloud results.
+- **Cloud comparison prompt guardrails** — inject local/cloud comparison results into stock-analysis prompts and cap aggressive advice when enabled comparison results are inconsistent or both local and cloud backtests underperform the benchmark.
+- **Daily decision action list** — add a disabled-by-default decision report module that groups analysis results into executable, wait-for-confirmation, and avoid/remove buckets with Markdown and JSON outputs.
 - feat(search): add SearXNG support as quota-free fallback (Fixes #550)
 - 📊 **LLM cost tracking** — all LLM calls (analysis, agent, market review) are recorded in the `llm_usage` table; new `GET /api/v1/usage/summary?period=today|month|all` endpoint returns aggregated token usage broken down by call type and model
 - ⚙️ **GitHub Actions LiteLLM 配置支持** — 工作流新增 `LITELLM_CONFIG`、`LITELLM_API_KEY`、`LITELLM_MODEL`、`LITELLM_CONFIG_YAML` 环境变量，支持使用提交 `litellm_config.yaml` 文件方式，或将 `litellm_config.yaml` 配置写入 GitHub Actions Variables 或 Secret 的方式，以实现灵活配置所有 AI 提供商（包括 siliconflow、AIHubMix 等），与本地环境保持一致；配置诊断步骤新增 LiteLLM 状态检查；`litellm_config.example.yaml` 新增 siliconflow 提供商配置示例
 ### Fixed
+- 🐛 **筹码分布缓存优先与日志降级** — 当日已有筹码缓存时直接使用本地缓存，避免重复请求不稳定远程接口；AkShare 筹码接口失败改为 warning，不再按阻断错误记录。
 - 🐛 **筹码结构 LLM 未填写时兜底补全** (#589) — DeepSeek 等模型未正确填写 `chip_structure` 时，自动用数据源已获取的筹码数据补全，保证各模型展示一致；普通分析与 Agent 模式均生效
 - 🐛 **历史报告狙击点位显示原始文本** (#452) — 历史详情页现优先展示 `raw_result.dashboard.battle_plan.sniper_points` 中的原始字符串，避免 `analysis_history` 数值列把区间、说明文字或复杂点位压缩成单个数字；保留原有数值列作为回退
 
 ### Changed
+- **Daily decision action list delivery** — when `DECISION_REPORT_ENABLED=true`, the stock-pool run now sends the generated daily action list after all stock analyses finish, and includes it in merged notifications/Feishu docs; action-list rows now include explicit no-position/holding actions, secondary entry, target, stop-loss, position text, and invalidation condition.
+- **Configuration precedence** — runtime app configuration now uses the repository `.env` file as the sole source for known app settings, preventing shell environment variables from overriding or supplementing model/API routing.
+- **Quant backtest dynamic date window** — add `QUANT_BACKTEST_LOOKBACK_YEARS` so local vectorbt backtests and JoinQuant script exports can derive start/end dates from the current date automatically.
+- **Quant stock source unification** — local vectorbt backtests and JoinQuant exports now default to `.env` `STOCK_LIST`; `stock_pool.txt` remains available for per-symbol date overrides.
 - 🔎 **Fetcher failure observability** — historical data logs now record fetcher start/success/failure with elapsed time, explicit failover transitions, and clearer final outcomes; Efinance/Eastmoney failures now include upstream endpoint and normalized categories such as `remote_disconnect` and `timeout`; Akshare 新浪/腾讯实时行情日志 now also include upstream endpoint and classified failures for HTTP status, disconnects, and malformed payloads
 
 ### Added

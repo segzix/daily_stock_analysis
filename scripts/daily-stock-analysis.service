@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily Stock Analysis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/segzix/Projects/daily_stock_analysis
+Environment="PATH=/home/segzix/miniconda3/envs/stock/bin:/usr/bin:/bin"
+ExecStart=/home/segzix/miniconda3/envs/stock/bin/python main.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/segzix/Projects/daily_stock_analysis/logs/service.log
+StandardError=append:/home/segzix/Projects/daily_stock_analysis/logs/service.log
+
+[Install]
+WantedBy=default.target

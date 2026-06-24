@@ -1463,7 +1463,7 @@ class AkshareFetcher(BaseFetcher):
             return chip
             
         except Exception as e:
-            logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
+            logger.warning(f"[API失败] 获取 {stock_code} 筹码分布失败: {e}")
             return None
     
     def get_enhanced_data(self, stock_code: str, days: int = 60) -> Dict[str, Any]:
@@ -1562,7 +1562,7 @@ class AkshareFetcher(BaseFetcher):
             return results
 
         except Exception as e:
-            logger.error(f"[Akshare] 获取指数行情失败: {e}")
+            logger.warning(f"[Akshare] 获取指数行情失败: {e}")
             return None
 
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
@@ -1597,7 +1597,7 @@ class AkshareFetcher(BaseFetcher):
             if df is not None and not df.empty:
                 return self._calc_market_stats(df)
         except Exception as e:
-            logger.error(f"[Akshare] 新浪接口获取市场统计也失败: {e}")
+            logger.warning(f"[Akshare] 新浪接口获取市场统计也失败: {e}")
 
         return None
 

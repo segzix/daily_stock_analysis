@@ -22,7 +22,13 @@ A股自选股智能分析系统 - 主调度程序
 - 买点偏好：缩量回踩 MA5/MA10 支撑
 """
 import os
+import warnings
 from src.config import setup_env
+
+# Suppress known-harmless shutdown noise (Python 3.12 __del__ + logging teardown)
+warnings.filterwarnings("ignore", message=".*utcfromtimestamp.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*There is no current event loop.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*unclosed event loop.*", category=ResourceWarning)
 setup_env()
 
 # 代理配置 - 通过 USE_PROXY 环境变量控制，默认关闭
@@ -41,6 +47,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from data_provider.base import canonical_stock_code
@@ -210,6 +217,84 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    # === Personal trades ===
+    parser.add_argument(
+        '--add-trade',
+        action='store_true',
+        help='Record a personal trade (use with --code --direction --price --volume --date '
+             '[--name] [--trigger] [--followed-rules/--no-followed-rules] [--notes])',
+    )
+    parser.add_argument(
+        '--code',
+        type=str,
+        default=None,
+        help='Stock code (for --add-trade, --list-trades, --trade-stats)',
+    )
+    parser.add_argument(
+        '--direction',
+        type=str,
+        choices=['buy', 'sell'],
+        default=None,
+        help='Trade direction: buy or sell',
+    )
+    parser.add_argument(
+        '--price',
+        type=float,
+        default=None,
+        help='Trade price',
+    )
+    parser.add_argument(
+        '--volume',
+        type=int,
+        default=None,
+        help='Trade volume (shares)',
+    )
+    parser.add_argument(
+        '--date',
+        type=str,
+        default=None,
+        help='Trade date (YYYY-MM-DD, default today)',
+    )
+    parser.add_argument(
+        '--name',
+        type=str,
+        default=None,
+        help='Stock name (optional)',
+    )
+    parser.add_argument(
+        '--trigger',
+        type=str,
+        default=None,
+        help='Exit trigger: stop_loss / take_profit / manual / signal',
+    )
+    parser.add_argument(
+        '--no-followed-rules',
+        action='store_true',
+        help='Mark this trade as not following the rules',
+    )
+    parser.add_argument(
+        '--notes',
+        type=str,
+        default=None,
+        help='Trade notes',
+    )
+    parser.add_argument(
+        '--list-trades',
+        action='store_true',
+        help='List personal trade records',
+    )
+    parser.add_argument(
+        '--delete-trade',
+        type=int,
+        default=None,
+        help='Delete a trade record by ID',
+    )
+    parser.add_argument(
+        '--trade-stats',
+        action='store_true',
+        help='Show per-stock trade stats (paired buy/sell P&L)',
+    )
+
     return parser.parse_args()
 
 
@@ -318,6 +403,36 @@ def run_full_analysis(
             merge_notification=merge_notification
         )
 
+        decision_report_content = ""
+        if results:
+            try:
+                from src.services.decision_service import write_decision_report
+
+                decision_report = write_decision_report(
+                    results,
+                    output_path=getattr(config, 'decision_report_output_path', 'reports/daily_decision_report.md'),
+                    report_type=getattr(config, 'decision_report_type', 'daily_action_list'),
+                )
+                logger.info(
+                    "每日行动清单已生成: %s",
+                    decision_report.get('files', {}).get('markdown'),
+                )
+                decision_report_path = decision_report.get('files', {}).get('markdown')
+                if decision_report_path:
+                    decision_report_content = Path(decision_report_path).read_text(encoding='utf-8')
+                if (
+                    decision_report_content
+                    and not args.no_notify
+                    and not merge_notification
+                    and pipeline.notifier.is_available()
+                ):
+                    if pipeline.notifier.send(decision_report_content, email_send_to_all=True):
+                        logger.info("每日行动清单已推送")
+                    else:
+                        logger.warning("每日行动清单推送失败")
+            except Exception as e:
+                logger.warning("每日行动清单生成失败: %s", e)
+
         # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
         analysis_delay = getattr(config, 'analysis_delay', 0)
         if (
@@ -359,6 +474,8 @@ def run_full_analysis(
                     getattr(config, 'report_type', 'simple'),
                 )
                 parts.append(f"# 🚀 个股决策仪表盘\n\n{dashboard_content}")
+            if decision_report_content:
+                parts.append(f"# ✅ 每日行动清单\n\n{decision_report_content}")
             if parts:
                 combined_content = "\n\n---\n\n".join(parts)
                 if pipeline.notifier.is_available():
@@ -406,6 +523,11 @@ def run_full_analysis(
                         getattr(config, 'report_type', 'simple'),
                     )
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
+
+                if decision_report_content:
+                    if full_content:
+                        full_content += "\n\n---\n\n"
+                    full_content += f"# ✅ 每日行动清单\n\n{decision_report_content}"
 
                 # 3. 创建文档
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
@@ -507,6 +629,178 @@ def start_bot_stream_clients(config: Config) -> None:
             logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
 
 
+def _ensure_search_proxy_running(config: Config) -> None:
+    """Auto-start SearXNG on localhost if configured and not already running."""
+    priority = getattr(config, "news_search_source_priority", "") or ""
+    if "searxng" not in priority.lower():
+        return
+
+    searxng_urls = getattr(config, "searxng_base_urls", []) or []
+    local_url = None
+    for url in searxng_urls:
+        if "127.0.0.1" in url or "localhost" in url:
+            local_url = url.rstrip("/")
+            break
+    if not local_url:
+        return
+
+    start_script = str(Path(__file__).parent / "scripts" / "start_searxng.sh")
+    if not Path(start_script).exists():
+        logger.warning(f"SearXNG 启动脚本不存在: {start_script}")
+        return
+
+    import subprocess
+
+    try:
+        subprocess.run(["bash", start_script], timeout=20, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        logger.warning("SearXNG 启动脚本超时")
+    except Exception as exc:
+        logger.error(f"SearXNG 启动失败: {exc}")
+        return
+
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            import urllib.request
+            resp = urllib.request.urlopen(f"{local_url}/search?format=json&q=test", timeout=3)
+            if resp.status == 200:
+                logger.info(f"SearXNG 已就绪: {local_url}")
+                return
+        except Exception:
+            pass
+
+    logger.warning("SearXNG 启动超时，搜索将回退到其他数据源")
+
+
+def _ensure_searxng_running(config: Config) -> None:
+    """Auto-start search proxy on localhost if configured and not already running."""
+    priority = getattr(config, "news_search_source_priority", "") or ""
+    if "searxng" not in priority.lower():
+        return
+    _ensure_search_proxy_running(config)
+
+
+def _cleanup_litellm() -> None:
+    """Close all litellm/httpx pools before interpreter teardown to suppress __del__ noise."""
+    import logging
+    try:
+        try:
+            import litellm
+            for attr in ("_async_http_handler", "_sync_http_handler", "client"):
+                handler = getattr(litellm, attr, None)
+                if handler and hasattr(handler, "close"):
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Also close the litellm client's transport pools
+        try:
+            import httpx
+            for obj in ("_async_client", "_sync_client"):
+                client = getattr(litellm, obj, None) if "litellm" in dir() else None
+                if client and hasattr(client, "_transport"):
+                    try:
+                        client._transport.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Kill search proxy started by this run
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-f", "search_proxy.py"], timeout=5, capture_output=True)
+    except Exception:
+        pass
+
+    # Suppress __del__ noise: raise root level so httpx/httpcore debug logs
+    # are silently dropped even after cleanup. Do NOT call logging.shutdown()
+    # because that invalidates handlers and causes AttributeError in __del__.
+    logging.root.setLevel(logging.CRITICAL + 1)
+
+
+def handle_personal_trades(args: argparse.Namespace) -> int:
+    """Handle personal trade journal CLI commands."""
+    from src.storage import get_db, PersonalTrade
+    from datetime import date as date_type
+
+    db = get_db()
+
+    # --add-trade
+    if args.add_trade:
+        if not args.code or not args.direction or args.price is None or args.volume is None:
+            logger.error("--add-trade requires --code, --direction, --price, --volume")
+            return 1
+        trade_date = date_type.today()
+        if args.date:
+            trade_date = date_type.fromisoformat(args.date)
+        followed = not args.no_followed_rules
+        tid = db.save_personal_trade(
+            code=args.code.upper(),
+            name=args.name,
+            direction=args.direction,
+            price=args.price,
+            volume=args.volume,
+            trade_date=trade_date,
+            trigger=args.trigger,
+            followed_rules=followed,
+            notes=args.notes,
+        )
+        logger.info(f"Trade recorded: id={tid} {args.code} {args.direction} {args.price} x{args.volume}")
+        return 0
+
+    # --list-trades
+    if args.list_trades:
+        trades = db.get_personal_trades(code=args.code)
+        if not trades:
+            logger.info("No trade records found.")
+            return 0
+        print(f"\n{'ID':<6} {'Date':<12} {'Code':<8} {'Name':<8} {'Dir':<4} {'Price':>8} {'Vol':>6} {'Trigger':<12} {'Rules':<6} {'Notes'}")
+        print("-" * 100)
+        for t in trades:
+            td = t  # now returns dict
+            rules_mark = "yes" if td.get('followed_rules') else "NO"
+            print(
+                f"{td.get('id',''):<6} {td.get('trade_date',''):<12} {td['code']:<8} {(td.get('name') or ''):<8} "
+                f"{td['direction']:<4} {td['price']:>8.3f} {td['volume']:>6} "
+                f"{(td.get('trigger') or ''):<12} {rules_mark:<6} {td.get('notes') or ''}"
+            )
+        return 0
+
+    # --delete-trade
+    if args.delete_trade is not None:
+        ok = db.delete_personal_trade(args.delete_trade)
+        if ok:
+            logger.info(f"Trade {args.delete_trade} deleted.")
+        else:
+            logger.warning(f"Trade {args.delete_trade} not found.")
+        return 0
+
+    # --trade-stats
+    if args.trade_stats:
+        pairs = db.get_personal_trade_stats(code=args.code)
+        if not pairs:
+            logger.info("No completed trade pairs found.")
+            return 0
+        print(f"\n{'Code':<8} {'Name':<10} {'Buy Date':<12} {'Buy':>8} {'Sell Date':<12} {'Sell':>8} {'Vol':>6} {'P&L%':>8} {'Trigger':<12} {'Rules'}")
+        print("-" * 110)
+        for p in pairs:
+            rules_mark = "yes" if p['followed_rules'] else "NO"
+            print(
+                f"{p['code']:<8} {p.get('name',''):<10} {p['buy_date']:<12} {p['buy_price']:>8.3f} "
+                f"{p['sell_date']:<12} {p['sell_price']:>8.3f} {p['volume']:>6} "
+                f"{p['pnl_pct']:>+7.2f}% {(p.get('trigger') or ''):<12} {rules_mark}"
+            )
+        print()
+        return 0
+
+    return -1  # no trade command matched (proceed to normal flow)
+
+
 def main() -> int:
     """
     主入口函数
@@ -514,6 +808,11 @@ def main() -> int:
     Returns:
         退出码（0 表示成功）
     """
+    # Suppress harmless httpx/__del__ noise during Python shutdown by closing
+    # litellm's connection pool before the logging system is torn down.
+    import atexit
+    atexit.register(_cleanup_litellm)
+
     # 解析命令行参数
     args = parse_arguments()
 
@@ -521,17 +820,30 @@ def main() -> int:
     config = get_config()
 
     # 配置日志（输出到控制台和文件）
-    setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
+    setup_logging(
+        log_prefix="stock_analysis",
+        debug=args.debug,
+        log_dir=config.log_dir,
+        console_info_modules={"__main__", "src.notification", "src.core.pipeline"},
+    )
 
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
+    # === 个人交易日记（独立于分析流程） ===
+    trade_result = handle_personal_trades(args)
+    if trade_result >= 0:
+        return trade_result
+
     # 验证配置
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
+
+    # Auto-start search proxy if configured and not already running
+    _ensure_search_proxy_running(config)
 
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None
@@ -642,6 +954,11 @@ def main() -> int:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     news_max_age_days=config.news_max_age_days,
+                    source_priority=getattr(
+                        config,
+                        'news_search_source_priority',
+                        'bocha,tavily,brave,serpapi,minimax,searxng',
+                    ),
                 )
 
             if config.gemini_api_key or config.openai_api_key:
@@ -694,16 +1011,6 @@ def main() -> int:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 
         logger.info("\n程序执行完成")
-
-        # 如果启用了服务且是非定时任务模式，保持程序运行
-        keep_running = start_serve and not (args.schedule or config.schedule_enabled)
-        if keep_running:
-            logger.info("API 服务运行中 (按 Ctrl+C 退出)...")
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
 
         return 0
 

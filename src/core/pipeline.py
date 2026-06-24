@@ -88,7 +88,17 @@ class StockAnalysisPipeline:
             brave_keys=self.config.brave_api_keys,
             serpapi_keys=self.config.serpapi_keys,
             minimax_keys=self.config.minimax_api_keys,
+            searxng_base_urls=self.config.searxng_base_urls,
+            bing_keys=getattr(self.config, 'bing_api_keys', None) or [],
+            google_cse_keys=getattr(self.config, 'google_cse_api_keys', None) or [],
+            google_cse_engine_id=getattr(self.config, 'google_cse_engine_id', None) or '',
+            duckduckgo_enabled=getattr(self.config, 'duckduckgo_enabled', False),
             news_max_age_days=self.config.news_max_age_days,
+            source_priority=getattr(
+                self.config,
+                'news_search_source_priority',
+                'bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo',
+            ),
         )
         
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
@@ -200,9 +210,9 @@ class StockAnalysisPipeline:
                               f"量比={volume_ratio}, 换手率={turnover_rate}% "
                               f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
                 else:
-                    logger.info(f"{stock_name}({code}) 实时行情获取失败或已禁用，将使用历史数据进行分析")
+                    logger.warning(f"{stock_name}({code}) 实时行情获取失败，将使用历史数据")
             except Exception as e:
-                logger.warning(f"{stock_name}({code}) 获取实时行情失败: {e}")
+                logger.warning(f"{stock_name}({code}) 实时行情获取失败: {e}")
 
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
@@ -245,10 +255,10 @@ class StockAnalysisPipeline:
                     if self.config.enable_realtime_quote and realtime_quote:
                         df = self._augment_historical_with_realtime(df, realtime_quote, code)
                     trend_result = self.trend_analyzer.analyze(df, code)
-                    logger.info(f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
-                              f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
+                    logger.info(f"{stock_name}({code}) 趋势分析完成: {trend_result.trend_status.value}, "
+                              f"信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
             except Exception as e:
-                logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
+                logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}")
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
@@ -268,7 +278,12 @@ class StockAnalysisPipeline:
                     total_results = sum(
                         len(r.results) for r in intel_results.values() if r.success
                     )
-                    logger.info(f"{stock_name}({code}) 情报搜索完成: 共 {total_results} 条结果")
+                    failed_dims = [d for d, r in intel_results.items() if not r.success]
+                    if failed_dims:
+                        logger.warning(f"{stock_name}({code}) 情报搜索完成: 共{total_results}条, "
+                                     f"失败维度={failed_dims}")
+                    else:
+                        logger.info(f"{stock_name}({code}) 情报搜索完成: 共{total_results}条")
                     logger.debug(f"{stock_name}({code}) 情报搜索结果:\n{news_context}")
 
                     # 保存新闻情报到数据库（用于后续复盘与查询）
@@ -287,7 +302,7 @@ class StockAnalysisPipeline:
                     except Exception as e:
                         logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
             else:
-                logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
+                logger.warning(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
@@ -314,8 +329,49 @@ class StockAnalysisPipeline:
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
+            if result:
+                logger.info(
+                    f"{stock_name}({code}) AI分析完成 → {result.operation_advice} "
+                    f"(评分{result.sentiment_score}, {result.decision_type})"
+                )
+            else:
+                logger.warning(f"{stock_name}({code}) AI分析返回空结果")
 
-            # Step 7.5: 填充分析时的价格信息到 result
+            # Step 7.5: 填充管线追踪信息
+            if result:
+                # Realtime quote trace
+                if realtime_quote:
+                    result.realtime_source = realtime_quote.source.value if hasattr(realtime_quote, 'source') else ""
+                    result.realtime_ok = True
+                else:
+                    result.realtime_ok = False
+
+                # Chip distribution trace
+                if chip_data:
+                    result.chip_source = getattr(chip_data, 'source', '')
+                    result.chip_ok = True
+                else:
+                    result.chip_ok = False
+
+                # Intelligence search trace (per dimension)
+                if 'intel_results' in dir() and intel_results:
+                    dim_desc_map = {
+                        'latest_news': '最新消息', 'market_analysis': '机构分析',
+                        'risk_check': '风险排查', 'earnings': '业绩预期', 'industry': '行业分析',
+                    }
+                    result.intel_trace = [
+                        {
+                            'dim': dim_name,
+                            'desc': dim_desc_map.get(dim_name, dim_name),
+                            'provider': r.provider,
+                            'success': r.success,
+                            'results': len(r.results) if r.results else 0,
+                            'error': r.error_message or '',
+                        }
+                        for dim_name, r in intel_results.items()
+                    ]
+
+            # Step 7.6: 填充分析时的价格信息到 result
             if result:
                 result.query_id = query_id
                 realtime_data = enhanced_context.get('realtime', {})
@@ -409,6 +465,8 @@ class StockAnalysisPipeline:
         if chip_data:
             current_price = getattr(realtime_quote, 'price', 0) if realtime_quote else 0
             enhanced['chip'] = {
+                'date': chip_data.date,
+                'source': chip_data.source,
                 'profit_ratio': chip_data.profit_ratio,
                 'avg_cost': chip_data.avg_cost,
                 'concentration_90': chip_data.concentration_90,
@@ -430,6 +488,16 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'macd_dif': trend_result.macd_dif,
+                'macd_dea': trend_result.macd_dea,
+                'macd_bar': trend_result.macd_bar,
+                'macd_status': trend_result.macd_status.value,
+                'macd_signal': trend_result.macd_signal,
+                'rsi_6': trend_result.rsi_6,
+                'rsi_12': trend_result.rsi_12,
+                'rsi_24': trend_result.rsi_24,
+                'rsi_status': trend_result.rsi_status.value,
+                'rsi_signal': trend_result.rsi_signal,
             }
 
         # Issue #234: Override today with realtime OHLC + trend MA for intraday analysis
@@ -922,7 +990,7 @@ class StockAnalysisPipeline:
             if result:
                 logger.info(
                     f"[{code}] 分析完成: {result.operation_advice}, "
-                    f"评分 {result.sentiment_score}"
+                    f"评分 {result.sentiment_score}, 决策 {result.decision_type}"
                 )
                 
                 # 单股推送模式（#55）：每分析完一只股票立即推送

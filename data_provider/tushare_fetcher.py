@@ -32,7 +32,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
-from .realtime_types import UnifiedRealtimeQuote
+from .realtime_types import ChipDistribution, UnifiedRealtimeQuote, safe_float
 from src.config import get_config
 import os
 from zoneinfo import ZoneInfo
@@ -103,6 +103,11 @@ class TushareFetcher(BaseFetcher):
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
         self._api: Optional[object] = None  # Tushare API 实例
+
+        # Quota-exhausted circuit breaker: once Tushare returns a quota/rate-limit
+        # error (e.g. "频率超限", "今天访问次数已达上限"), skip this fetcher for
+        # the rest of the run instead of wasting a call per stock.
+        self._quota_exhausted_until: float = 0.0
 
         # 尝试初始化 API
         self._init_api()
@@ -206,7 +211,11 @@ class TushareFetcher(BaseFetcher):
         Returns:
             True 表示可用，False 表示不可用
         """
-        return self._api is not None
+        if self._api is None:
+            return False
+        if self._quota_exhausted_until and time.time() < self._quota_exhausted_until:
+            return False
+        return True
 
     def _check_rate_limit(self) -> None:
         """
@@ -355,12 +364,22 @@ class TushareFetcher(BaseFetcher):
             
         except Exception as e:
             error_msg = str(e).lower()
-            
-            # 检测配额超限
-            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+
+            # Detect quota / rate-limit errors and trip the circuit breaker
+            # so we stop hitting Tushare for the rest of this run.
+            # Known Tushare limit messages (Chinese):
+            #   "频率超限" (rate limit exceeded per minute)
+            #   "今天访问次数已达上限" (daily limit)
+            #   "您没有接口访问权限" (no permission)
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限', '超限', '已达上限',
+                                                         '访问次数', '访问接口']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
+                # Trip quota-exhausted circuit breaker for 1 hour so
+                # DataFetcherManager's `is_available` check skips Tushare
+                # for all remaining stocks in this run.
+                self._quota_exhausted_until = time.time() + 3600
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            
+
             raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -501,7 +520,78 @@ class TushareFetcher(BaseFetcher):
             logger.warning(f"Tushare 获取股票列表失败: {e}")
         
         return None
-    
+
+    @staticmethod
+    def _ratio_from_tushare(value: Any) -> float:
+        """Normalize Tushare percentage-like values to 0-1 ratio."""
+        ratio = safe_float(value)
+        if ratio > 1:
+            ratio = ratio / 100
+        return ratio
+
+    @staticmethod
+    def _concentration_range(low: float, high: float, avg_cost: float) -> float:
+        """Approximate concentration from cost percentile range."""
+        if low <= 0 or high <= 0 or avg_cost <= 0:
+            return 0.0
+        return max(0.0, (high - low) / avg_cost)
+
+    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
+        """Get chip distribution from Tushare cyq_perf when account permissions allow it."""
+        if self._api is None:
+            return None
+        if _is_us_code(stock_code) or _is_etf_code(stock_code):
+            return None
+
+        try:
+            self._check_rate_limit()
+            ts_code = self._convert_stock_code(stock_code)
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y%m%d')
+            logger.info(f"[API调用] ts.pro_api().cyq_perf(ts_code={ts_code}) 获取筹码分布...")
+            df = self._api.cyq_perf(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                fields=(
+                    'ts_code,trade_date,his_low,his_high,cost_5pct,cost_15pct,'
+                    'cost_50pct,cost_85pct,cost_95pct,weight_avg,winner_rate'
+                ),
+            )
+            if df is None or df.empty:
+                logger.warning(f"[Tushare] cyq_perf 返回空数据: {ts_code}")
+                return None
+
+            df = df.sort_values('trade_date')
+            latest = df.iloc[-1]
+            avg_cost = safe_float(latest.get('weight_avg')) or safe_float(latest.get('cost_50pct'))
+            cost_90_low = safe_float(latest.get('cost_5pct'))
+            cost_90_high = safe_float(latest.get('cost_95pct'))
+            cost_70_low = safe_float(latest.get('cost_15pct'))
+            cost_70_high = safe_float(latest.get('cost_85pct'))
+            chip = ChipDistribution(
+                code=normalize_stock_code(stock_code),
+                date=str(latest.get('trade_date', '')),
+                source='tushare',
+                profit_ratio=self._ratio_from_tushare(latest.get('winner_rate')),
+                avg_cost=avg_cost,
+                cost_90_low=cost_90_low,
+                cost_90_high=cost_90_high,
+                concentration_90=self._concentration_range(cost_90_low, cost_90_high, avg_cost),
+                cost_70_low=cost_70_low,
+                cost_70_high=cost_70_high,
+                concentration_70=self._concentration_range(cost_70_low, cost_70_high, avg_cost),
+            )
+            logger.info(
+                f"[筹码分布-Tushare] {stock_code} 日期={chip.date}: "
+                f"获利比例={chip.profit_ratio:.1%}, 平均成本={chip.avg_cost}, "
+                f"90%集中度={chip.concentration_90:.2%}"
+            )
+            return chip
+        except Exception as e:
+            logger.warning(f"[Tushare] cyq_perf 获取筹码分布失败 {stock_code}: {e}")
+            return None
+
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情

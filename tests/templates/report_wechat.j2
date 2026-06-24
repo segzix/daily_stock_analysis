@@ -1,3 +1,4 @@
+{% from '_macros.j2' import render_backtests %}
 ## 🎯 {{ report_date }} 决策仪表盘
 
 > {{ results|length }}只股票 | 🟢买入:{{ buy_count }} 🟡观望:{{ hold_count }} 🔴卖出:{{ sell_count }}
@@ -7,6 +8,7 @@
 {% for e in enriched %}
 {{ e.signal_emoji }} **{{ e.stock_name }}({{ e.result.code }})**: {{ e.result.operation_advice }} | 评分 {{ e.result.sentiment_score }} | {{ e.result.trend_prediction }}
 {% endfor %}
+{{ render_backtests(analysis_backtests, quant_backtests, compact=True) }}
 {% else %}
 {% for e in enriched %}
 {% set result = e.result %}
@@ -73,6 +75,7 @@
 
 ---
 {% endfor %}
+{{ render_backtests(analysis_backtests, quant_backtests, compact=True) }}
 {% endif %}
 
 *生成时间: {{ report_timestamp[11:16] }}*

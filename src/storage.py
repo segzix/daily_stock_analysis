@@ -395,6 +395,68 @@ class LLMUsage(Base):
     called_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class ChipDistributionCache(Base):
+    """Latest successful chip distribution snapshots for fallback use."""
+
+    __tablename__ = 'chip_distribution_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    source = Column(String(50), nullable=False)
+    profit_ratio = Column(Float)
+    avg_cost = Column(Float)
+    cost_90_low = Column(Float)
+    cost_90_high = Column(Float)
+    concentration_90 = Column(Float)
+    cost_70_low = Column(Float)
+    cost_70_high = Column(Float)
+    concentration_70 = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', 'source', name='uix_chip_code_date_source'),
+        Index('ix_chip_code_created', 'code', 'created_at'),
+    )
+
+
+class PersonalTrade(Base):
+    """Personal trade journal — records actual buy/sell executions."""
+
+    __tablename__ = 'personal_trades'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    direction = Column(String(4), nullable=False)  # 'buy' or 'sell'
+    price = Column(Float, nullable=False)
+    volume = Column(Integer, nullable=False)  # shares
+    trade_date = Column(Date, nullable=False, index=True)
+    trigger = Column(String(20))  # stop_loss / take_profit / manual / signal
+    followed_rules = Column(Boolean, default=True)  # whether traded per plan
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index('ix_trade_code_date', 'code', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'code': self.code,
+            'name': self.name,
+            'direction': self.direction,
+            'price': self.price,
+            'volume': self.volume,
+            'trade_date': self.trade_date.isoformat() if self.trade_date else None,
+            'trigger': self.trigger,
+            'followed_rules': self.followed_rules,
+            'notes': self.notes,
+        }
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式
@@ -1062,7 +1124,131 @@ class DatabaseManager:
                 raise
         
         return saved_count
-    
+
+    def save_chip_distribution(self, chip_data: Any) -> None:
+        """Persist a successful chip distribution snapshot for future fallback."""
+        if chip_data is None:
+            return
+
+        chip_date = getattr(chip_data, 'date', None) or date.today().isoformat()
+        if isinstance(chip_date, str):
+            try:
+                trade_date = datetime.strptime(chip_date[:10], '%Y-%m-%d').date()
+            except ValueError:
+                trade_date = date.today()
+        elif isinstance(chip_date, datetime):
+            trade_date = chip_date.date()
+        elif isinstance(chip_date, date):
+            trade_date = chip_date
+        else:
+            trade_date = date.today()
+
+        code = getattr(chip_data, 'code', '')
+        source = getattr(chip_data, 'source', 'unknown')
+        values = {
+            'profit_ratio': getattr(chip_data, 'profit_ratio', None),
+            'avg_cost': getattr(chip_data, 'avg_cost', None),
+            'cost_90_low': getattr(chip_data, 'cost_90_low', None),
+            'cost_90_high': getattr(chip_data, 'cost_90_high', None),
+            'concentration_90': getattr(chip_data, 'concentration_90', None),
+            'cost_70_low': getattr(chip_data, 'cost_70_low', None),
+            'cost_70_high': getattr(chip_data, 'cost_70_high', None),
+            'concentration_70': getattr(chip_data, 'concentration_70', None),
+        }
+
+        with self.session_scope() as session:
+            existing = session.execute(
+                select(ChipDistributionCache).where(
+                    and_(
+                        ChipDistributionCache.code == code,
+                        ChipDistributionCache.trade_date == trade_date,
+                        ChipDistributionCache.source == source,
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                for key, value in values.items():
+                    setattr(existing, key, value)
+                existing.updated_at = datetime.now()
+            else:
+                session.add(
+                    ChipDistributionCache(
+                        code=code,
+                        trade_date=trade_date,
+                        source=source,
+                        **values,
+                    )
+                )
+        logger.info("筹码分布缓存已保存: %s, date=%s", code, trade_date)
+
+    def get_recent_chip_distribution(self, code: str, max_age_days: int = 7):
+        """Return the most recent valid chip distribution cache within max_age_days."""
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        with self.session_scope() as session:
+            cached = session.execute(
+                select(ChipDistributionCache)
+                .where(
+                    and_(
+                        ChipDistributionCache.code == code,
+                        ChipDistributionCache.created_at >= cutoff,
+                    )
+                )
+                .order_by(desc(ChipDistributionCache.trade_date), desc(ChipDistributionCache.created_at))
+            ).scalar_one_or_none()
+
+            if cached is None:
+                return None
+
+            from data_provider.realtime_types import ChipDistribution
+
+            return ChipDistribution(
+                code=cached.code,
+                date=cached.trade_date.isoformat(),
+                source=f"cache:{cached.source}",
+                profit_ratio=cached.profit_ratio or 0.0,
+                avg_cost=cached.avg_cost or 0.0,
+                cost_90_low=cached.cost_90_low or 0.0,
+                cost_90_high=cached.cost_90_high or 0.0,
+                concentration_90=cached.concentration_90 or 0.0,
+                cost_70_low=cached.cost_70_low or 0.0,
+                cost_70_high=cached.cost_70_high or 0.0,
+                concentration_70=cached.concentration_70 or 0.0,
+            )
+
+    def get_chip_distribution_by_date(self, code: str, trade_date: date):
+        """Return a chip distribution cache for the exact trade date when available."""
+        with self.session_scope() as session:
+            cached = session.execute(
+                select(ChipDistributionCache)
+                .where(
+                    and_(
+                        ChipDistributionCache.code == code,
+                        ChipDistributionCache.trade_date == trade_date,
+                    )
+                )
+                .order_by(desc(ChipDistributionCache.created_at))
+            ).scalar_one_or_none()
+
+            if cached is None:
+                return None
+
+            from data_provider.realtime_types import ChipDistribution
+
+            return ChipDistribution(
+                code=cached.code,
+                date=cached.trade_date.isoformat(),
+                source=f"cache:{cached.source}",
+                profit_ratio=cached.profit_ratio or 0.0,
+                avg_cost=cached.avg_cost or 0.0,
+                cost_90_low=cached.cost_90_low or 0.0,
+                cost_90_high=cached.cost_90_high or 0.0,
+                concentration_90=cached.concentration_90 or 0.0,
+                cost_70_low=cached.cost_70_low or 0.0,
+                cost_70_high=cached.cost_70_high or 0.0,
+                concentration_70=cached.concentration_70 or 0.0,
+            )
+
     def get_analysis_context(
         self, 
         code: str,
@@ -1477,6 +1663,118 @@ class DatabaseManager:
                 )
             )
             return result.rowcount
+
+    # ------------------------------------------------------------------
+    # Personal trade journal
+    # ------------------------------------------------------------------
+
+    def save_personal_trade(
+        self,
+        code: str,
+        direction: str,
+        price: float,
+        volume: int,
+        trade_date: date,
+        name: Optional[str] = None,
+        trigger: Optional[str] = None,
+        followed_rules: bool = True,
+        notes: Optional[str] = None,
+    ) -> int:
+        """Save a personal trade record. Returns the row id."""
+        row = PersonalTrade(
+            code=code,
+            name=name,
+            direction=direction,
+            price=price,
+            volume=volume,
+            trade_date=trade_date,
+            trigger=trigger,
+            followed_rules=followed_rules,
+            notes=notes,
+        )
+        with self.session_scope() as session:
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def get_personal_trades(
+        self,
+        code: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List personal trades, newest first. Returns list of dicts."""
+        conditions = []
+        if code:
+            conditions.append(PersonalTrade.code == code)
+        if start_date:
+            conditions.append(PersonalTrade.trade_date >= start_date)
+        if end_date:
+            conditions.append(PersonalTrade.trade_date <= end_date)
+
+        with self.session_scope() as session:
+            stmt = (
+                select(PersonalTrade)
+                .where(and_(*conditions) if conditions else True)
+                .order_by(desc(PersonalTrade.trade_date), desc(PersonalTrade.id))
+                .limit(limit)
+            )
+            rows = list(session.execute(stmt).scalars().all())
+            return [r.to_dict() for r in rows]
+
+    def delete_personal_trade(self, trade_id: int) -> bool:
+        """Delete a single trade by id. Returns True if deleted."""
+        with self.session_scope() as session:
+            row = session.get(PersonalTrade, trade_id)
+            if row is None:
+                return False
+            session.delete(row)
+            return True
+
+    def get_personal_trade_stats(self, code: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return per-stock trade stats (paired buy/sell)."""
+        with self.session_scope() as session:
+            # select all trades ordered by date
+            conditions = [PersonalTrade.code == code] if code else []
+            rows = list(
+                session.execute(
+                    select(PersonalTrade)
+                    .where(and_(*conditions) if conditions else True)
+                    .order_by(PersonalTrade.trade_date, PersonalTrade.id)
+                )
+                .scalars()
+                .all()
+            )
+
+            # convert to dicts while session is active (avoids DetachedInstanceError)
+            trade_dicts = [r.to_dict() for r in rows]
+
+        # pair buys and sells sequentially per stock
+        from collections import defaultdict, deque
+        stock_buys: Dict[str, deque] = defaultdict(deque)
+        pairs = []
+
+        for t in trade_dicts:
+            if t['direction'] == 'buy':
+                stock_buys[t['code']].append(t)
+            else:  # sell
+                if stock_buys[t['code']]:
+                    buy = stock_buys[t['code']].popleft()
+                    pnl_pct = round((t['price'] - buy['price']) / buy['price'] * 100, 2)
+                    pairs.append({
+                        'code': t['code'],
+                        'name': t.get('name') or buy.get('name') or '',
+                        'buy_date': buy['trade_date'],
+                        'buy_price': buy['price'],
+                        'sell_date': t['trade_date'],
+                        'sell_price': t['price'],
+                        'volume': t['volume'],
+                        'pnl_pct': pnl_pct,
+                        'trigger': t.get('trigger'),
+                        'followed_rules': t.get('followed_rules'),
+                    })
+        return pairs
 
     # ------------------------------------------------------------------
     # LLM usage tracking

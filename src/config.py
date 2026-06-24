@@ -13,10 +13,11 @@ A股自选股智能分析系统 - 配置管理模块
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
-from dotenv import load_dotenv, dotenv_values
+from dotenv import dotenv_values
 from dataclasses import dataclass, field
 
 
@@ -39,23 +40,71 @@ class ConfigIssue:
         return self.message
 
 
-def setup_env(override: bool = False):
+def _project_env_path() -> Path:
+    return Path(__file__).parent.parent / '.env'
+
+
+def _known_config_env_keys(env_path: Path) -> set[str]:
+    keys: set[str] = set()
+    example_path = env_path.with_name('.env.example')
+    for path in (example_path, Path(__file__)):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding='utf-8')
+        keys.update(re.findall(r"^\s*#?\s*([A-Z][A-Z0-9_]+)=", text, flags=re.MULTILINE))
+        keys.update(re.findall(r"os\.getenv\(['\"]([^'\"]+)", text))
+
+    dynamic_prefixes = (
+        'LLM_',
+        'STOCK_GROUP_',
+        'EMAIL_GROUP_',
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'ALL_PROXY',
+        'NO_PROXY',
+    )
+    for key in os.environ:
+        if key.startswith(dynamic_prefixes) or key.lower() in {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}:
+            keys.add(key)
+
+    return keys
+
+
+def _normalize_proxy_url(value: Optional[str]) -> Optional[str]:
+    """Normalize proxy URLs so requests can determine the SOCKS version."""
+    if not value:
+        return value
+    stripped = value.strip()
+    if stripped.lower().startswith('socks://'):
+        return f"socks5://{stripped[len('socks://'):] }"
+    return stripped
+
+
+def setup_env(override: bool = True):
     """
     Initialize environment variables from .env file.
 
     Args:
-        override: If True, overwrite existing environment variables with values
-                  from .env file. Set to True when reloading config after updates.
-                  Default is False to preserve behavior on initial load where
-                  system environment variables take precedence.
+        override: Kept for compatibility. App configuration is always sourced
+                  from the repository .env file so shell variables cannot
+                  override or supplement app config.
     """
-    # src/config.py -> src/ -> root
-    env_file = os.getenv("ENV_FILE")
-    if env_file:
-        env_path = Path(env_file)
-    else:
-        env_path = Path(__file__).parent.parent / '.env'
-    load_dotenv(dotenv_path=env_path, override=override)
+    env_path = _project_env_path()
+    env_values = {
+        key: value
+        for key, value in dotenv_values(env_path).items()
+        if key and value is not None
+    }
+
+    for key in _known_config_env_keys(env_path):
+        if key not in env_values:
+            os.environ.pop(key, None)
+            os.environ.pop(key.lower(), None)
+
+    for key, value in env_values.items():
+        if key.lower() in {'http_proxy', 'https_proxy', 'all_proxy'}:
+            value = _normalize_proxy_url(value)
+        os.environ[key] = value
 
 
 @dataclass
@@ -137,10 +186,23 @@ class Config:
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
+    bing_api_keys: List[str] = field(default_factory=list)  # Bing Web Search v7 API Keys
+    google_cse_api_keys: List[str] = field(default_factory=list)  # Google Custom Search API Keys
+    google_cse_engine_id: Optional[str] = None  # Google Custom Search Engine ID (cx)
+    duckduckgo_enabled: bool = False  # Whether to use DuckDuckGo (no API key) as a fallback
+    news_search_source_priority: str = (
+        "bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo"
+    )
 
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
+
+    # === 交易策略风格 ===
+    # conservative: 严进宽出，宁可错过不买错（默认）
+    # moderate:    平衡，适当放宽入场条件
+    # aggressive:  进取，放宽趋势和乖离率要求
+    strategy_style: str = "conservative"
 
     # === Agent 模式配置 ===
     agent_mode: bool = False
@@ -245,6 +307,39 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
+
+    # === Quant strategy backtest prompt context ===
+    quant_backtest_enabled: bool = False
+    quant_backtest_auto_run: bool = False
+    quant_backtest_prompt_enabled: bool = False
+    quant_backtest_summary_path: str = "reports/stock_pool_backtest_summary.json"
+    quant_backtest_use_stock_list: bool = True
+    quant_backtest_stock_pool_path: str = "stock_pool.txt"
+    quant_backtest_stale_hours: int = 24
+    quant_backtest_lookback_years: int = 0
+    quant_backtest_start_date: str = "20200101"
+    quant_backtest_end_date: str = "20240501"
+    quant_backtest_fast_window: int = 5
+    quant_backtest_slow_window: int = 20
+    quant_backtest_data_source: str = "akshare"
+    joinquant_username: Optional[str] = None
+    joinquant_password: Optional[str] = None
+    joinquant_auth_file: str = "data/joinquant_auth.json"
+
+    # === Cloud backtest and decision modules ===
+    cloud_backtest_enabled: bool = False
+    cloud_backtest_provider: str = "joinquant"
+    cloud_backtest_summary_path: str = "reports/cloud_backtest_summary.json"
+    backtest_compare_enabled: bool = False
+    backtest_comparison_path: str = "reports/backtest_comparison.json"
+    backtest_compare_max_return_diff_pct: float = 5.0
+    backtest_compare_max_drawdown_diff_pct: float = 5.0
+    backtest_compare_max_trade_count_diff: int = 3
+    decision_rule_enabled: bool = False
+    decision_rule_config_path: str = "config/decision_rules.yaml"
+    decision_report_enabled: bool = False
+    decision_report_type: str = "daily_action_list"
+    decision_report_output_path: str = "reports/daily_decision_report.md"
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -274,6 +369,8 @@ class Config:
     enable_realtime_technical_indicators: bool = True
     # 筹码分布开关（该接口不稳定，云端部署建议关闭）
     enable_chip_distribution: bool = True
+    # 筹码分布缓存有效期（天）：接口失败时允许使用最近一次成功结果
+    chip_distribution_cache_ttl_days: int = 7
     # 东财接口补丁开关
     enable_eastmoney_patch: bool = False
     # 实时行情数据源优先级（逗号分隔）
@@ -283,6 +380,13 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    # Per-operation data source priorities. Empty values fall back to fetcher priority.
+    daily_data_source_priority: str = ""
+    stock_name_source_priority: str = "local,realtime,tushare,akshare,efinance,pytdx,baostock,yfinance"
+    chip_distribution_source_priority: str = "tushare,akshare"
+    main_index_source_priority: str = "akshare,yfinance"
+    market_stats_source_priority: str = "akshare"
+    sector_ranking_source_priority: str = "akshare"
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -565,6 +669,17 @@ class Config:
                 ", ".join(invalid_searxng_urls[:3]),
             )
 
+        # New search providers (Bing / Google CSE / DuckDuckGo) — fallback chain
+        # for when paid providers (Tavily etc.) hit their quotas.
+        bing_keys_str = os.getenv('BING_API_KEYS', '')
+        bing_api_keys = [k.strip() for k in bing_keys_str.split(',') if k.strip()]
+
+        google_cse_keys_str = os.getenv('GOOGLE_CSE_API_KEYS', '')
+        google_cse_api_keys = [k.strip() for k in google_cse_keys_str.split(',') if k.strip()]
+        google_cse_engine_id = (os.getenv('GOOGLE_CSE_ENGINE_ID') or '').strip() or None
+
+        duckduckgo_enabled = os.getenv('DUCKDUCKGO_ENABLED', 'false').lower() == 'true'
+
         # 企微消息类型与最大字节数逻辑
         wechat_msg_type = os.getenv('WECHAT_MSG_TYPE', 'markdown')
         wechat_msg_type_lower = wechat_msg_type.lower()
@@ -627,8 +742,17 @@ class Config:
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
+            bing_api_keys=bing_api_keys,
+            google_cse_api_keys=google_cse_api_keys,
+            google_cse_engine_id=google_cse_engine_id,
+            duckduckgo_enabled=duckduckgo_enabled,
+            news_search_source_priority=os.getenv(
+                'NEWS_SEARCH_SOURCE_PRIORITY',
+                'bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo',
+            ),
             news_max_age_days=max(1, int(os.getenv('NEWS_MAX_AGE_DAYS', '3'))),
             bias_threshold=max(1.0, float(os.getenv('BIAS_THRESHOLD', '5.0'))),
+            strategy_style=os.getenv('STRATEGY_STYLE', 'conservative').strip().lower(),
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             agent_max_steps=int(os.getenv('AGENT_MAX_STEPS', '10')),
             agent_skills=[s.strip() for s in os.getenv('AGENT_SKILLS', '').split(',') if s.strip()],
@@ -685,6 +809,47 @@ class Config:
             backtest_min_age_days=int(os.getenv('BACKTEST_MIN_AGE_DAYS', '14')),
             backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
             backtest_neutral_band_pct=float(os.getenv('BACKTEST_NEUTRAL_BAND_PCT', '2.0')),
+            quant_backtest_enabled=os.getenv('QUANT_BACKTEST_ENABLED', 'false').lower() == 'true',
+            quant_backtest_auto_run=os.getenv('QUANT_BACKTEST_AUTO_RUN', 'false').lower() == 'true',
+            quant_backtest_prompt_enabled=os.getenv('QUANT_BACKTEST_PROMPT_ENABLED', 'false').lower() == 'true',
+            quant_backtest_summary_path=os.getenv(
+                'QUANT_BACKTEST_SUMMARY_PATH',
+                'reports/stock_pool_backtest_summary.json',
+            ),
+            quant_backtest_use_stock_list=os.getenv('QUANT_BACKTEST_USE_STOCK_LIST', 'true').lower() == 'true',
+            quant_backtest_stock_pool_path=os.getenv('QUANT_BACKTEST_STOCK_POOL_PATH', 'stock_pool.txt'),
+            quant_backtest_stale_hours=int(os.getenv('QUANT_BACKTEST_STALE_HOURS', '24')),
+            quant_backtest_lookback_years=int(os.getenv('QUANT_BACKTEST_LOOKBACK_YEARS', '0')),
+            quant_backtest_start_date=os.getenv('QUANT_BACKTEST_START_DATE', '20200101'),
+            quant_backtest_end_date=os.getenv('QUANT_BACKTEST_END_DATE', '20240501'),
+            quant_backtest_fast_window=int(os.getenv('QUANT_BACKTEST_FAST_WINDOW', '5')),
+            quant_backtest_slow_window=int(os.getenv('QUANT_BACKTEST_SLOW_WINDOW', '20')),
+            quant_backtest_data_source=os.getenv('QUANT_BACKTEST_DATA_SOURCE', 'akshare').strip().lower(),
+            joinquant_username=os.getenv('JOINQUANT_USERNAME') or None,
+            joinquant_password=os.getenv('JOINQUANT_PASSWORD') or None,
+            joinquant_auth_file=os.getenv('JOINQUANT_AUTH_FILE', 'data/joinquant_auth.json'),
+            cloud_backtest_enabled=os.getenv('CLOUD_BACKTEST_ENABLED', 'false').lower() == 'true',
+            cloud_backtest_provider=os.getenv('CLOUD_BACKTEST_PROVIDER', 'joinquant'),
+            cloud_backtest_summary_path=os.getenv(
+                'CLOUD_BACKTEST_SUMMARY_PATH',
+                'reports/cloud_backtest_summary.json',
+            ),
+            backtest_compare_enabled=os.getenv('BACKTEST_COMPARE_ENABLED', 'false').lower() == 'true',
+            backtest_comparison_path=os.getenv(
+                'BACKTEST_COMPARISON_PATH',
+                'reports/backtest_comparison.json',
+            ),
+            backtest_compare_max_return_diff_pct=float(os.getenv('BACKTEST_COMPARE_MAX_RETURN_DIFF_PCT', '5')),
+            backtest_compare_max_drawdown_diff_pct=float(os.getenv('BACKTEST_COMPARE_MAX_DRAWDOWN_DIFF_PCT', '5')),
+            backtest_compare_max_trade_count_diff=int(os.getenv('BACKTEST_COMPARE_MAX_TRADE_COUNT_DIFF', '3')),
+            decision_rule_enabled=os.getenv('DECISION_RULE_ENABLED', 'false').lower() == 'true',
+            decision_rule_config_path=os.getenv('DECISION_RULE_CONFIG_PATH', 'config/decision_rules.yaml'),
+            decision_report_enabled=os.getenv('DECISION_REPORT_ENABLED', 'false').lower() == 'true',
+            decision_report_type=os.getenv('DECISION_REPORT_TYPE', 'daily_action_list'),
+            decision_report_output_path=os.getenv(
+                'DECISION_REPORT_OUTPUT_PATH',
+                'reports/daily_decision_report.md',
+            ),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=int(os.getenv('MAX_WORKERS', '3')),
@@ -733,6 +898,7 @@ class Config:
                 'ENABLE_REALTIME_TECHNICAL_INDICATORS', 'true'
             ).lower() == 'true',
             enable_chip_distribution=os.getenv('ENABLE_CHIP_DISTRIBUTION', 'true').lower() == 'true',
+            chip_distribution_cache_ttl_days=int(os.getenv('CHIP_DISTRIBUTION_CACHE_TTL_DAYS', '7')),
             # 东财接口补丁开关
             enable_eastmoney_patch=os.getenv('ENABLE_EASTMONEY_PATCH', 'false').lower() == 'true',
             # 实时行情数据源优先级：
@@ -741,6 +907,15 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
+            daily_data_source_priority=os.getenv('DAILY_DATA_SOURCE_PRIORITY', ''),
+            stock_name_source_priority=os.getenv(
+                'STOCK_NAME_SOURCE_PRIORITY',
+                'local,realtime,tushare,akshare,efinance,pytdx,baostock,yfinance',
+            ),
+            chip_distribution_source_priority=os.getenv('CHIP_DISTRIBUTION_SOURCE_PRIORITY', 'tushare,akshare'),
+            main_index_source_priority=os.getenv('MAIN_INDEX_SOURCE_PRIORITY', 'akshare,yfinance'),
+            market_stats_source_priority=os.getenv('MARKET_STATS_SOURCE_PRIORITY', 'akshare'),
+            sector_ranking_source_priority=os.getenv('SECTOR_RANKING_SOURCE_PRIORITY', 'akshare'),
             realtime_cache_ttl=int(os.getenv('REALTIME_CACHE_TTL', '600')),
             circuit_breaker_cooldown=int(os.getenv('CIRCUIT_BREAKER_COOLDOWN', '300'))
         )
@@ -1246,6 +1421,45 @@ class Config:
         db_path = Path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path.absolute()}"
+
+    def resolve_quant_backtest_dates(self, today: Optional[date] = None) -> tuple[str, str]:
+        """Resolve quant backtest dates from lookback years or static env dates."""
+        lookback_years = int(getattr(self, 'quant_backtest_lookback_years', 0) or 0)
+        if lookback_years <= 0:
+            return self.quant_backtest_start_date, self.quant_backtest_end_date
+
+        end_date = today or date.today()
+        try:
+            start_date = end_date.replace(year=end_date.year - lookback_years)
+        except ValueError:
+            start_date = end_date.replace(month=2, day=28, year=end_date.year - lookback_years)
+        return start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d')
+
+    def resolve_quant_stock_pool_items(self) -> list[dict[str, str | None]]:
+        """Resolve quant backtest stock pool from STOCK_LIST or stock_pool.txt."""
+        if getattr(self, 'quant_backtest_use_stock_list', True):
+            return [
+                {"symbol": code, "start_date": None, "end_date": None}
+                for code in self.stock_list
+                if code
+            ]
+
+        stock_pool_path = Path(self.quant_backtest_stock_pool_path)
+        items: list[dict[str, str | None]] = []
+        for line in stock_pool_path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [part.strip() for part in line.split(',')]
+            if len(parts) == 1:
+                items.append({"symbol": parts[0], "start_date": None, "end_date": None})
+            elif len(parts) == 3 and all(parts):
+                items.append({"symbol": parts[0], "start_date": parts[1], "end_date": parts[2]})
+            else:
+                raise ValueError(
+                    f"Invalid stock pool line: {line}. Expected 'symbol' or 'symbol,start_date,end_date'."
+                )
+        return items
 
 
 # === 便捷的配置访问函数 ===

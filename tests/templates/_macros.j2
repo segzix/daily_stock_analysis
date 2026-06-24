@@ -1,0 +1,75 @@
+{# Shared macros for report templates #}
+{% macro market_snapshot(result) %}
+{% set snapshot = result.market_snapshot if result.market_snapshot else {} %}
+{% if snapshot %}
+### 📈 当日行情
+
+| 收盘 | 昨收 | 开盘 | 最高 | 最低 | 涨跌幅 | 涨跌额 | 振幅 | 成交量 | 成交额 |
+|------|------|------|------|------|-------|-------|------|--------|--------|
+| {{ snapshot.get('close', 'N/A') }} | {{ snapshot.get('prev_close', 'N/A') }} | {{ snapshot.get('open', 'N/A') }} | {{ snapshot.get('high', 'N/A') }} | {{ snapshot.get('low', 'N/A') }} | {{ snapshot.get('pct_chg', 'N/A') }} | {{ snapshot.get('change_amount', 'N/A') }} | {{ snapshot.get('amplitude', 'N/A') }} | {{ snapshot.get('volume', 'N/A') }} | {{ snapshot.get('amount', 'N/A') }} |
+{% if snapshot.get('price') %}
+
+| 当前价 | 量比 | 换手率 | 行情来源 |
+|-------|------|--------|----------|
+| {{ snapshot.get('price', 'N/A') }} | {{ snapshot.get('volume_ratio', 'N/A') }} | {{ snapshot.get('turnover_rate', 'N/A') }} | {{ snapshot.get('source', 'N/A') }} |
+{% endif %}
+
+{% endif %}
+{% endmacro %}
+
+{% macro backtest_icon(ctx) -%}
+{%- if ctx and ctx.get('effective') -%}
+✅
+{%- elif ctx and ctx.get('status') in ['error', 'failed'] -%}
+❌
+{%- elif ctx -%}
+⚠️
+{%- else -%}
+⚪
+{%- endif -%}
+{%- endmacro %}
+
+{% macro render_backtests(analysis_backtests, quant_backtests, compact=False, heading='##') %}
+{% if analysis_backtests or quant_backtests %}
+{% if compact %}
+**📈 回测验证**
+{% if analysis_backtests %}
+AI历史: {{ backtest_icon(analysis_backtests) }} {{ analysis_backtests.conclusion }}
+{% endif %}
+{% if quant_backtests %}
+量化策略: {{ backtest_icon(quant_backtests) }} {{ quant_backtests.conclusion }}
+{% endif %}
+{% else %}
+{{ heading }} 📈 回测验证
+
+{% if analysis_backtests %}
+- **AI历史回测**：{{ backtest_icon(analysis_backtests) }} {{ analysis_backtests.conclusion }}
+{% set overall = analysis_backtests.get('overall') or {} %}
+{% if overall %}
+
+| 样本 | 胜率 | 方向准确率 | 平均收益 |
+|------|------|------------|----------|
+| {{ overall.get('completed_count', 'N/A') }} | {{ '%.2f'|format(overall.get('win_rate_pct') or 0) }}% | {{ '%.2f'|format(overall.get('direction_accuracy_pct') or 0) }}% | {{ '%.2f'|format(overall.get('avg_return_pct') or 0) }}% |
+{% endif %}
+{% endif %}
+
+{% if quant_backtests %}
+- **量化策略回测**：{{ backtest_icon(quant_backtests) }} {{ quant_backtests.conclusion }}
+{% if quant_backtests.items %}
+- 策略：{{ quant_backtests.strategy }} | 区间：{{ quant_backtests.start_date }} 至 {{ quant_backtests.end_date }} | 成功：{{ quant_backtests.success }} | 失败：{{ quant_backtests.failed }}
+
+| 股票 | 收益 | 基准 | 最大回撤 | 夏普 | 胜率 | 风险 |
+|------|------|------|----------|------|------|------|
+{% for bt in quant_backtests.top_by_sharpe[:5] %}
+| {{ bt.symbol }} | {{ '%.2f'|format(bt.metrics.total_return_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.benchmark_return_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.max_drawdown_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.sharpe_ratio or 0) }} | {{ '%.2f'|format(bt.metrics.win_rate_pct or 0) }}% | {{ bt.assessment.risk_level }} |
+{% endfor %}
+{% if quant_backtests.high_risk_items %}
+
+**高风险提示**：{{ quant_backtests.high_risk_items|map(attribute='symbol')|join(', ') }}
+{% endif %}
+{% endif %}
+{% endif %}
+
+{% endif %}
+{% endif %}
+{% endmacro %}

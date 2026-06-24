@@ -1,0 +1,32 @@
+# 每日行动清单 - {{ report.generated_at }}
+
+总计：{{ report.total }} 只标的
+
+{% for category, label in category_labels.items() %}
+{% set items = report.groups.get(category, []) %}
+## {{ label }}（{{ items | length }}）
+
+{% if not items %}
+- 无
+
+{% elif category == "today_executable" %}
+{% for item in items %}
+- 🎯 **{{ item.name }}**（{{ item.symbol }}）— {{ item.operation_advice }}（评分 {{ item.score }}）
+  入场 {{ item.entry_price or "—" }} ｜ 止损 {{ item.stop_loss or "—" }} ｜ 目标 {{ item.target_price or "—" }} ｜ 仓位 {{ item.position_text }}
+{% endfor %}
+
+{% elif category == "wait_for_confirmation" %}
+{% for item in items %}
+- ⏳ **{{ item.name }}**（{{ item.symbol }}）— {{ item.operation_advice }}（评分 {{ item.score }}）
+  条件：{{ item.entry_condition }}
+{% endfor %}
+
+{% else %}
+{% for item in items %}
+- 🛑 **{{ item.name }}**（{{ item.symbol }}）— {{ item.operation_advice }}（评分 {{ item.score }}）
+  原因：{{ item.risk_flags[0] if item.risk_flags else item.core_conclusion or "—" }}
+{% endfor %}
+
+{% endif %}
+
+{% endfor %}

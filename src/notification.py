@@ -199,6 +199,102 @@ class NotificationService(
         self._history_compare_cache[cache_key] = history_by_code
         return {"history_by_code": history_by_code}
 
+    def _get_report_extra_context(self, results: List[AnalysisResult]) -> Dict[str, Any]:
+        """Build optional report context for renderer templates."""
+        context = self._get_history_compare_context(results)
+        context.update(self._get_backtest_report_context(results))
+        return context
+
+    def _get_backtest_report_context(self, results: List[AnalysisResult]) -> Dict[str, Any]:
+        """Build AI and quant backtest context for every report path."""
+        context = self._get_analysis_backtest_context(results)
+        context.update(self._get_quant_backtest_context(results))
+        return context
+
+    def _get_quant_backtest_context(self, results: List[AnalysisResult]) -> Dict[str, Any]:
+        """Load quant strategy backtest summaries for report rendering."""
+        config = get_config()
+        if not bool(getattr(config, "quant_backtest_enabled", False)):
+            return {
+                "quant_backtests": {
+                    "enabled": False,
+                    "status": "disabled",
+                    "conclusion": "量化回测未启用",
+                    "items": [],
+                    "source_file": getattr(
+                        config,
+                        "quant_backtest_summary_path",
+                        "reports/stock_pool_backtest_summary.json",
+                    ),
+                }
+            }
+
+        try:
+            from src.services.quant_context_service import load_quant_backtest_context
+
+            return load_quant_backtest_context(results)
+        except Exception as e:
+            logger.debug("Quant backtest context skipped: %s", e)
+            return {"quant_backtests": None}
+
+    def _get_analysis_backtest_context(self, results: List[AnalysisResult]) -> Dict[str, Any]:
+        """Load AI analysis backtest summaries for report rendering."""
+        config = get_config()
+        enabled = bool(getattr(config, "backtest_enabled", True))
+        if not enabled:
+            return {
+                "analysis_backtests": {
+                    "enabled": False,
+                    "status": "disabled",
+                    "conclusion": "AI 历史回测未启用",
+                    "items": [],
+                }
+            }
+
+        try:
+            from src.services.backtest_service import BacktestService
+            from src.storage import get_db
+
+            service = BacktestService(get_db())
+            eval_window_days = getattr(config, "backtest_eval_window_days", None)
+            overall = service.get_summary(scope="overall", code=None, eval_window_days=eval_window_days)
+            items = []
+            for result in results:
+                summary = service.get_summary(scope="stock", code=result.code, eval_window_days=eval_window_days)
+                if summary:
+                    items.append(summary)
+        except Exception as e:
+            logger.debug("Analysis backtest context skipped: %s", e)
+            return {
+                "analysis_backtests": {
+                    "enabled": True,
+                    "status": "error",
+                    "conclusion": f"AI 历史回测查询失败：{str(e)[:80]}",
+                    "items": [],
+                }
+            }
+
+        completed = int((overall or {}).get("completed_count") or 0)
+        if completed <= 0:
+            status = "empty"
+            conclusion = "AI 历史回测已启用，但暂无可用汇总"
+        else:
+            status = "effective"
+            win_rate = self._fmt_pct((overall or {}).get("win_rate_pct"))
+            direction_accuracy = self._fmt_pct((overall or {}).get("direction_accuracy_pct"))
+            conclusion = f"AI 历史回测生效：样本 {completed}，胜率 {win_rate}，方向准确率 {direction_accuracy}"
+
+        return {
+            "analysis_backtests": {
+                "enabled": True,
+                "status": status,
+                "effective": completed > 0,
+                "conclusion": conclusion,
+                "overall": overall,
+                "items": items,
+            }
+        }
+
     def generate_aggregate_report(
         self,
         results: List[AnalysisResult],
@@ -536,7 +632,11 @@ class NotificationService(
             "---",
             "",
         ])
-        
+
+        backtest_context = self._get_backtest_report_context(results)
+        self._append_aggregate_pipeline_trace(report_lines, results, backtest_context)
+        self._append_backtest_section(report_lines, backtest_context)
+
         # Issue #262: summary_only 时仅输出摘要，跳过个股详情
         if self._report_summary_only:
             report_lines.extend(["## 📊 分析结果摘要", ""])
@@ -709,6 +809,152 @@ class NotificationService(
                 return value[len(prefix):]
         return value
 
+    @staticmethod
+    def _fmt_pct(value: Any) -> str:
+        """Format percent-like values for compact report output."""
+        if value is None or value == "":
+            return "N/A"
+        try:
+            return f"{float(value):.2f}%"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _backtest_status_icon(backtest_context: Optional[Dict[str, Any]]) -> str:
+        """Return a compact status icon for a backtest context block."""
+        if not backtest_context:
+            return "⚪"
+        if backtest_context.get("effective"):
+            return "✅"
+        status = str(backtest_context.get("status") or "").lower()
+        if status in {"error", "failed"}:
+            return "❌"
+        if status in {"disabled", "missing", "empty", "no_match", "ineffective"}:
+            return "⚠️"
+        return "⚪"
+
+    @staticmethod
+    def _backtest_effectiveness_verdict(backtest_context: Optional[Dict[str, Any]]) -> str:
+        """Return a concise effectiveness verdict for backtest context."""
+        if not backtest_context:
+            return ""
+        analysis = backtest_context.get("analysis_backtests")
+        if not analysis:
+            return ""
+        if not analysis.get("enabled", True):
+            return "未启用"
+        if analysis.get("effective"):
+            return "已生效"
+        status = str(analysis.get("status") or "")
+        if status == "empty":
+            return "待积累"
+        if status == "error":
+            return "异常"
+        return "未生效"
+
+    def _format_backtest_trace(self, backtest_context: Optional[Dict[str, Any]]) -> str:
+        """Format backtest effectiveness for the pipeline trace block."""
+        if not backtest_context:
+            return ""
+
+        parts = []
+        analysis = backtest_context.get("analysis_backtests")
+        if analysis:
+            parts.append(f"AI历史: {self._backtest_status_icon(analysis)} {analysis.get('conclusion', 'N/A')}")
+
+        quant = backtest_context.get("quant_backtests")
+        if quant:
+            parts.append(f"量化策略: {self._backtest_status_icon(quant)} {quant.get('conclusion', 'N/A')}")
+
+        trace = "；".join(parts)
+        verdict = self._backtest_effectiveness_verdict(backtest_context)
+        if verdict:
+            trace += f" → {verdict}"
+        return trace
+
+    def _append_backtest_section(
+        self,
+        lines: List[str],
+        backtest_context: Optional[Dict[str, Any]],
+        *,
+        heading_level: int = 2,
+        compact: bool = False,
+    ) -> None:
+        """Append a standalone backtest verification section to report lines."""
+        if not backtest_context:
+            return
+
+        analysis = backtest_context.get("analysis_backtests")
+        quant = backtest_context.get("quant_backtests")
+        if not analysis and not quant:
+            return
+
+        if compact:
+            lines.append("**📈 回测验证**")
+            if analysis:
+                lines.append(
+                    f"AI历史: {self._backtest_status_icon(analysis)} {analysis.get('conclusion', 'N/A')}"
+                )
+            if quant:
+                lines.append(
+                    f"量化策略: {self._backtest_status_icon(quant)} {quant.get('conclusion', 'N/A')}"
+                )
+            lines.append("")
+            return
+
+        heading = "#" * heading_level
+        lines.extend([f"{heading} 📈 回测验证", ""])
+        if analysis:
+            lines.append(f"- **AI历史回测**：{self._backtest_status_icon(analysis)} {analysis.get('conclusion', 'N/A')}")
+            overall = analysis.get("overall") or {}
+            if overall:
+                lines.extend([
+                    "",
+                    "| 样本 | 胜率 | 方向准确率 | 平均收益 |",
+                    "|------|------|------------|----------|",
+                    (
+                        f"| {overall.get('completed_count', 'N/A')} | "
+                        f"{self._fmt_pct(overall.get('win_rate_pct'))} | "
+                        f"{self._fmt_pct(overall.get('direction_accuracy_pct'))} | "
+                        f"{self._fmt_pct(overall.get('avg_return_pct'))} |"
+                    ),
+                ])
+            lines.append("")
+
+        if quant:
+            lines.append(f"- **量化策略回测**：{self._backtest_status_icon(quant)} {quant.get('conclusion', 'N/A')}")
+            if quant.get("items"):
+                lines.append(
+                    f"- 策略：{quant.get('strategy', 'N/A')} | "
+                    f"区间：{quant.get('start_date', 'N/A')} 至 {quant.get('end_date', 'N/A')} | "
+                    f"成功：{quant.get('success', 0)} | 失败：{quant.get('failed', 0)}"
+                )
+                lines.extend([
+                    "",
+                    "| 股票 | 收益 | 基准 | 最大回撤 | 夏普 | 胜率 | 风险 |",
+                    "|------|------|------|----------|------|------|------|",
+                ])
+                for bt in (quant.get("top_by_sharpe") or quant.get("items") or [])[:5]:
+                    metrics = bt.get("metrics") or {}
+                    assessment = bt.get("assessment") or {}
+                    lines.append(
+                        f"| {bt.get('symbol', bt.get('code', 'N/A'))} | "
+                        f"{self._fmt_pct(metrics.get('total_return_pct'))} | "
+                        f"{self._fmt_pct(metrics.get('benchmark_return_pct'))} | "
+                        f"{self._fmt_pct(metrics.get('max_drawdown_pct'))} | "
+                        f"{metrics.get('sharpe_ratio', 'N/A')} | "
+                        f"{self._fmt_pct(metrics.get('win_rate_pct'))} | "
+                        f"{assessment.get('risk_level', 'N/A')} |"
+                    )
+                if quant.get("high_risk_items"):
+                    high_risk = ", ".join(
+                        item.get("symbol", item.get("code", "N/A")) for item in quant.get("high_risk_items", [])
+                    )
+                    lines.extend(["", f"**高风险提示**：{high_risk}"])
+            lines.append("")
+
+        lines.extend(["---", ""])
+
     def _get_signal_level(self, result: AnalysisResult) -> tuple:
         """
         Get signal level and color based on operation advice.
@@ -778,7 +1024,7 @@ class NotificationService(
                 results=results,
                 report_date=report_date,
                 summary_only=self._report_summary_only,
-                extra_context=self._get_history_compare_context(results),
+                extra_context=self._get_report_extra_context(results),
             )
             if out:
                 return out
@@ -819,6 +1065,10 @@ class NotificationService(
                 "---",
                 "",
             ])
+
+        backtest_context = self._get_backtest_report_context(results)
+        self._append_aggregate_pipeline_trace(report_lines, results, backtest_context)
+        self._append_backtest_section(report_lines, backtest_context)
 
         # 逐个股票的决策仪表盘（Issue #262: summary_only 时跳过详情）
         if not self._report_summary_only:
@@ -1054,6 +1304,7 @@ class NotificationService(
                 results=results,
                 report_date=datetime.now().strftime('%Y-%m-%d'),
                 summary_only=self._report_summary_only,
+                extra_context=self._get_report_extra_context(results),
             )
             if out:
                 return out
@@ -1074,7 +1325,9 @@ class NotificationService(
             f"> {len(results)}只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
             "",
         ]
-        
+        backtest_context = self._get_backtest_report_context(results)
+        self._append_aggregate_pipeline_trace(lines, results, backtest_context)
+
         # Issue #262: summary_only 时仅输出摘要列表
         if self._report_summary_only:
             lines.append("**📊 分析结果摘要**")
@@ -1086,6 +1339,8 @@ class NotificationService(
                     f"{signal_emoji} **{stock_name}({r.code})**: {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"
                 )
+            lines.append("")
+            self._append_backtest_section(lines, backtest_context, compact=True)
         else:
             for result in sorted_results:
                 signal_text, signal_emoji, _ = self._get_signal_level(result)
@@ -1181,6 +1436,8 @@ class NotificationService(
                 
                 lines.append("---")
                 lines.append("")
+
+            self._append_backtest_section(lines, backtest_context, heading_level=3, compact=True)
         
         # 底部
         lines.append(f"*生成时间: {datetime.now().strftime('%H:%M')}*")
@@ -1244,7 +1501,11 @@ class NotificationService(
                 lines.append(f"⚠️ {risk}")
             
             lines.append("")
-        
+
+        backtest_context = self._get_backtest_report_context(results)
+        self._append_aggregate_pipeline_trace(lines, results, backtest_context)
+        self._append_backtest_section(lines, backtest_context, compact=True)
+
         # 底部（模型行在 --- 之前，Issue #528）
         models = self._collect_models_used(results)
         if models:
@@ -1284,6 +1545,7 @@ class NotificationService(
                 results=results,
                 report_date=report_date,
                 summary_only=False,
+                extra_context=self._get_report_extra_context(results),
             )
             if out:
                 return out
@@ -1308,6 +1570,9 @@ class NotificationService(
             one = (core.get('one_sentence') or r.analysis_summary or '')[:60]
             lines.append(f"**{self._escape_md(name)}({r.code})** {emoji} {r.operation_advice} | 评分{r.sentiment_score} | {one}")
         lines.append("")
+        backtest_context = self._get_backtest_report_context(results)
+        self._append_aggregate_pipeline_trace(lines, results, backtest_context)
+        self._append_backtest_section(lines, backtest_context, compact=True)
         lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         return "\n".join(lines)
 
@@ -1341,6 +1606,9 @@ class NotificationService(
             "",
         ]
 
+        backtest_context = self._get_backtest_report_context([result])
+        self._append_pipeline_trace(lines, result, backtest_context)
+
         self._append_market_snapshot(lines, result)
         
         # 核心决策（一句话）
@@ -1356,42 +1624,60 @@ class NotificationService(
         # 重要信息（舆情+基本面）
         info_added = False
         if intel:
-            if intel.get('earnings_outlook'):
+            latest_news = intel.get('latest_news', '')
+            earnings = intel.get('earnings_outlook', '')
+            sentiment = intel.get('sentiment_summary', '')
+
+            if latest_news and latest_news.strip():
                 if not info_added:
                     lines.append("### 📰 重要信息")
                     lines.append("")
                     info_added = True
-                lines.append(f"📊 **业绩预期**: {intel['earnings_outlook'][:100]}")
-            
-            if intel.get('sentiment_summary'):
+                lines.append(f"📢 **最新动态**: {latest_news[:120]}")
+                lines.append("")
+
+            if earnings and earnings.strip():
                 if not info_added:
                     lines.append("### 📰 重要信息")
                     lines.append("")
                     info_added = True
-                lines.append(f"💭 **舆情情绪**: {intel['sentiment_summary'][:80]}")
-            
-            # 风险警报
+                lines.append(f"📊 **业绩预期**: {earnings[:100]}")
+                lines.append("")
+
+            if sentiment and sentiment.strip():
+                if not info_added:
+                    lines.append("### 📰 重要信息")
+                    lines.append("")
+                    info_added = True
+                lines.append(f"💭 **舆情情绪**: {sentiment[:80]}")
+                lines.append("")
+
             risks = intel.get('risk_alerts', [])
             if risks:
                 if not info_added:
                     lines.append("### 📰 重要信息")
                     lines.append("")
                     info_added = True
-                lines.append("")
                 lines.append("🚨 **风险警报**:")
                 for risk in risks[:3]:
-                    lines.append(f"- {risk[:60]}")
-            
-            # 利好催化
+                    lines.append(f"  • {risk}")
+                lines.append("")
+
             catalysts = intel.get('positive_catalysts', [])
             if catalysts:
-                lines.append("")
+                if not info_added:
+                    lines.append("### 📰 重要信息")
+                    lines.append("")
+                    info_added = True
                 lines.append("✨ **利好催化**:")
                 for cat in catalysts[:3]:
-                    lines.append(f"- {cat[:60]}")
+                    lines.append(f"  • {cat}")
+                lines.append("")
         
         if info_added:
             lines.append("")
+
+        self._append_backtest_section(lines, backtest_context, heading_level=3)
         
         # 狙击点位
         sniper = battle.get('sniper_points', {}) if battle else {}
@@ -1426,6 +1712,147 @@ class NotificationService(
         lines.append("*AI生成，仅供参考，不构成投资建议*")
 
         return "\n".join(lines)
+
+    def _append_aggregate_pipeline_trace(
+        self,
+        lines: List[str],
+        results: List[AnalysisResult],
+        backtest_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append a compact aggregate pipeline trace for multi-stock reports."""
+        trace_parts = []
+
+        realtime_ok = sum(1 for r in results if getattr(r, "realtime_ok", False))
+        realtime_total = sum(1 for r in results if getattr(r, "realtime_source", ""))
+        if realtime_total > 0:
+            sources = sorted({
+                getattr(r, "realtime_source", "")
+                for r in results
+                if getattr(r, "realtime_ok", False) and getattr(r, "realtime_source", "")
+            })
+            source_str = "/".join(sources) if sources else "N/A"
+            if realtime_ok >= realtime_total * 0.8:
+                status = "✅"
+            elif realtime_ok == 0:
+                status = "❌"
+            else:
+                status = "⚠️"
+            trace_parts.append(f"实时行情: {status} {realtime_ok}/{realtime_total} {source_str}")
+        elif any(not getattr(r, "realtime_ok", True) for r in results):
+            trace_parts.append("实时行情: ❌ 无可用数据源")
+
+        chip_ok = sum(1 for r in results if getattr(r, "chip_ok", False))
+        chip_total = sum(1 for r in results if getattr(r, "chip_source", ""))
+        if chip_total > 0:
+            if chip_ok >= chip_total * 0.8:
+                status = "✅"
+            elif chip_ok == 0:
+                status = "❌"
+            else:
+                status = "⚠️"
+            trace_parts.append(f"筹码分布: {status} {chip_ok}/{chip_total}")
+        elif any(getattr(r, "chip_ok", True) is False for r in results):
+            trace_parts.append("筹码分布: ❌ 无可用数据源")
+
+        intel_ok = 0
+        intel_total = 0
+        for r in results:
+            intel = getattr(r, "intel_trace", None)
+            if intel:
+                intel_total += 1
+                if any(t["success"] for t in intel):
+                    intel_ok += 1
+        if intel_total > 0:
+            if intel_ok >= intel_total * 0.8:
+                status = "✅"
+            elif intel_ok == 0:
+                status = "❌"
+            else:
+                status = "⚠️"
+            trace_parts.append(f"情报搜索: {status} {intel_ok}/{intel_total}")
+
+        backtest_trace = self._format_backtest_trace(backtest_context)
+        if backtest_trace:
+            trace_parts.append(f"回测验证: {backtest_trace}")
+
+        if trace_parts:
+            lines.insert(2, "> 🔍 管线追踪")
+            idx = 3
+            for part in trace_parts:
+                lines.insert(idx, f">     {part}")
+                idx += 1
+            lines.insert(idx, ">")
+
+    def _append_pipeline_trace(
+        self,
+        lines: List[str],
+        result: AnalysisResult,
+        backtest_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append pipeline execution trace at the top of the report."""
+        trace_parts = []
+
+        # --- Realtime quote ---
+        if getattr(result, 'realtime_source', ''):
+            status = "✅" if getattr(result, 'realtime_ok', False) else "❌"
+            trace_parts.append(f"实时行情: {status} {result.realtime_source}")
+        elif getattr(result, 'realtime_ok', True) is False:
+            trace_parts.append("实时行情: ❌ 无可用数据源")
+
+        # --- Chip distribution ---
+        if hasattr(result, 'chip_source') and result.chip_source:
+            status = "✅" if getattr(result, 'chip_ok', False) else "❌"
+            trace_parts.append(f"筹码分布: {status} {result.chip_source}")
+        elif getattr(result, 'chip_ok', True) is False:
+            trace_parts.append("筹码分布: ❌ 无可用数据源")
+
+        # --- Intelligence search ---
+        intel_trace = getattr(result, 'intel_trace', None)
+        if intel_trace:
+            intel_parts = []
+            # Collapse identical failures: if all use same provider & all fail, show once
+            providers_set = set(t['provider'] for t in intel_trace)
+            all_same_provider = len(providers_set) == 1
+            all_fail = all(not t['success'] for t in intel_trace)
+            if all_same_provider and all_fail:
+                provider = intel_trace[0]['provider']
+                err = intel_trace[0].get('error', '')[:40].replace('\n', ' ')
+                intel_parts.append(f"❌ 全部5维={provider}({err})")
+            else:
+                for t in intel_trace:
+                    icon = "✅" if t['success'] else "❌"
+                    detail = f"{icon} {t['desc']}={t['provider']}"
+                    if not t['success'] and t.get('error'):
+                        short_err = t['error'][:40].replace('\n', ' ')
+                        detail += f"({short_err})"
+                    elif t['success']:
+                        detail += f"({t['results']}条)"
+                    intel_parts.append(detail)
+            trace_parts.append(f"情报搜索: {' · '.join(intel_parts)}")
+
+        backtest_trace = self._format_backtest_trace(backtest_context)
+        if backtest_trace:
+            trace_parts.append(f"回测验证: {backtest_trace}")
+
+        if trace_parts:
+            model = normalize_model_used(getattr(result, "model_used", None))
+            if model:
+                trace_parts.append(f"LLM: {model}")
+
+            lines.insert(2, "> 🔍 管线追踪")
+            idx = 3
+            for part in trace_parts:
+                if part.startswith("情报搜索:"):
+                    label, details = part.split(": ", 1)
+                    lines.insert(idx, f">     {label}:")
+                    idx += 1
+                    for sub in details.split(" · "):
+                        lines.insert(idx, f">         {sub}")
+                        idx += 1
+                else:
+                    lines.insert(idx, f">     {part}")
+                    idx += 1
+            lines.insert(idx, ">")
 
     # Display name mapping for realtime data sources
     _SOURCE_DISPLAY_NAMES = {

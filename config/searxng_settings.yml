@@ -1,0 +1,28 @@
+use_default_settings: true
+general:
+  debug: false
+  instance_name: "Stock-Search"
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+engines:
+  - name: brave
+    disabled: true
+server:
+  port: 8888
+  bind_address: "127.0.0.1"
+  secret_key: "local-stock-analysis-proxy"
+  limiter: false
+  image_proxy: false
+  public_instance: false
+valkey:
+  url: false
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 20.0
+  enable_http2: false
+  proxies:
+    all://:
+      - http://127.0.0.1:7897

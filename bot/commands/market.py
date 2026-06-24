@@ -92,6 +92,11 @@ class MarketCommand(BotCommand):
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     news_max_age_days=config.news_max_age_days,
+                    source_priority=getattr(
+                        config,
+                        'news_search_source_priority',
+                        'bocha,tavily,brave,serpapi,minimax,searxng',
+                    ),
                 )
 
             # 初始化 AI 分析器

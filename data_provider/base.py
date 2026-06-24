@@ -18,7 +18,7 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, List, Tuple, Dict, Any
 
 import pandas as pd
@@ -34,6 +34,20 @@ from src.data.stock_mapping import STOCK_NAME_MAP
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+FETCHER_SOURCE_ALIASES = {
+    "akshare": "AkshareFetcher",
+    "akshare_em": "AkshareFetcher",
+    "akshare_sina": "AkshareFetcher",
+    "tencent": "AkshareFetcher",
+    "akshare_qq": "AkshareFetcher",
+    "efinance": "EfinanceFetcher",
+    "tushare": "TushareFetcher",
+    "pytdx": "PytdxFetcher",
+    "baostock": "BaostockFetcher",
+    "yfinance": "YfinanceFetcher",
+}
 
 
 # === 标准化列名定义 ===
@@ -493,6 +507,29 @@ class DataFetcherManager:
         """添加数据源并重新排序"""
         self._fetchers.append(fetcher)
         self._fetchers.sort(key=lambda f: f.priority)
+
+    def _ordered_fetchers(self, priority: str) -> List[BaseFetcher]:
+        """Return fetchers ordered by a comma-separated source priority."""
+        if not priority:
+            return list(self._fetchers)
+
+        ordered: List[BaseFetcher] = []
+        added = set()
+        by_name = {fetcher.name: fetcher for fetcher in self._fetchers}
+        for source in priority.split(','):
+            source = source.strip().lower()
+            if not source:
+                continue
+            fetcher_name = FETCHER_SOURCE_ALIASES.get(source)
+            fetcher = by_name.get(fetcher_name or source)
+            if fetcher and fetcher.name not in added:
+                ordered.append(fetcher)
+                added.add(fetcher.name)
+
+        for fetcher in self._fetchers:
+            if fetcher.name not in added:
+                ordered.append(fetcher)
+        return ordered
     
     def get_daily_data(
         self, 
@@ -524,6 +561,7 @@ class DataFetcherManager:
             DataFetchError: 所有数据源都失败时抛出
         """
         from .us_index_mapping import is_us_index_code, is_us_stock_code
+        from src.config import get_config
 
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
@@ -569,7 +607,18 @@ class DataFetcherManager:
             logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
-        for attempt, fetcher in enumerate(self._fetchers, start=1):
+        ordered_fetchers = self._ordered_fetchers(getattr(get_config(), 'daily_data_source_priority', ''))
+        total_fetchers = len(ordered_fetchers)
+        for attempt, fetcher in enumerate(ordered_fetchers, start=1):
+            # Skip fetchers that have been tripped by their internal circuit
+            # breaker (e.g. Tushare quota exhausted). Use getattr defensively
+            # because not all fetcher classes implement `is_available`.
+            if not getattr(fetcher, 'is_available', lambda: True)():
+                logger.info(
+                    f"[数据源跳过 {attempt}/{total_fetchers}] [{fetcher.name}] "
+                    f"{stock_code}: 数据源不可用（配额熔断或未初始化），跳过"
+                )
+                continue
             try:
                 logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
                 df = fetcher.get_daily_data(
@@ -596,7 +645,7 @@ class DataFetcherManager:
                 )
                 errors.append(error_msg)
                 if attempt < total_fetchers:
-                    next_fetcher = self._fetchers[attempt]
+                    next_fetcher = ordered_fetchers[attempt]
                     logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
                 # 继续尝试下一个数据源
                 continue
@@ -916,11 +965,29 @@ class DataFetcherManager:
 
         circuit_breaker = get_chip_circuit_breaker()
 
+        try:
+            from src.storage import get_db
+
+            today_cached_chip = get_db().get_chip_distribution_by_date(stock_code, date.today())
+            if today_cached_chip is not None:
+                logger.info(
+                    f"[筹码分布] {stock_code} 使用今日缓存: "
+                    f"date={today_cached_chip.date}, source={today_cached_chip.source}"
+                )
+                return today_cached_chip
+        except Exception as cache_error:
+            logger.debug(f"[筹码分布] 今日缓存读取失败: {cache_error}")
+
         # 定义筹码数据源优先级列表
+        source_key_by_fetcher = {
+            "AkshareFetcher": "akshare_chip",
+            "TushareFetcher": "tushare_chip",
+            "EfinanceFetcher": "efinance_chip",
+        }
         chip_sources = [
-            ("AkshareFetcher", "akshare_chip"),
-            ("TushareFetcher", "tushare_chip"),
-            ("EfinanceFetcher", "efinance_chip"),
+            (fetcher.name, source_key_by_fetcher.get(fetcher.name, fetcher.name.lower()))
+            for fetcher in self._ordered_fetchers(getattr(config, 'chip_distribution_source_priority', 'tushare,akshare'))
+            if fetcher.name in source_key_by_fetcher
         ]
 
         for fetcher_name, source_key in chip_sources:
@@ -936,6 +1003,12 @@ class DataFetcherManager:
                             chip = fetcher.get_chip_distribution(stock_code)
                             if chip is not None:
                                 circuit_breaker.record_success(source_key)
+                                try:
+                                    from src.storage import get_db
+
+                                    get_db().save_chip_distribution(chip)
+                                except Exception as cache_error:
+                                    logger.debug(f"[筹码分布] 缓存保存失败: {cache_error}")
                                 logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
                                 return chip
                         break
@@ -944,7 +1017,23 @@ class DataFetcherManager:
                 circuit_breaker.record_failure(source_key, str(e))
                 continue
 
-        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
+        try:
+            from src.storage import get_db
+
+            cached_chip = get_db().get_recent_chip_distribution(
+                stock_code,
+                max_age_days=max(0, getattr(config, 'chip_distribution_cache_ttl_days', 7)),
+            )
+            if cached_chip is not None:
+                logger.warning(
+                    f"[筹码分布] {stock_code} 所有数据源均失败，使用最近缓存: "
+                    f"date={cached_chip.date}, source={cached_chip.source}"
+                )
+                return cached_chip
+        except Exception as cache_error:
+            logger.debug(f"[筹码分布] 缓存读取失败: {cache_error}")
+
+        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败，且无可用缓存")
         return None
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
@@ -978,18 +1067,32 @@ class DataFetcherManager:
         if not hasattr(self, '_stock_name_cache'):
             self._stock_name_cache = {}
         
-        # 2. 尝试从实时行情中获取（最快，可按需禁用）
-        if allow_realtime:
-            quote = self.get_realtime_quote(stock_code)
-            if quote and hasattr(quote, 'name') and quote.name:
-                name = quote.name
-                self._stock_name_cache[stock_code] = name
-                logger.info(f"[股票名称] 从实时行情获取: {stock_code} -> {name}")
-                return name
+        from src.config import get_config
 
-        # 3. 依次尝试各个数据源
-        for fetcher in self._fetchers:
-            if hasattr(fetcher, 'get_stock_name'):
+        config = get_config()
+        priority = getattr(
+            config,
+            'stock_name_source_priority',
+            'local,realtime,tushare,akshare,efinance,pytdx,baostock,yfinance',
+        )
+        tried_realtime = False
+        for source in [item.strip().lower() for item in priority.split(',') if item.strip()]:
+            if source == 'local':
+                continue
+            if source == 'realtime':
+                if allow_realtime and not tried_realtime:
+                    tried_realtime = True
+                    quote = self.get_realtime_quote(stock_code)
+                    if quote and hasattr(quote, 'name') and quote.name:
+                        name = quote.name
+                        self._stock_name_cache[stock_code] = name
+                        logger.info(f"[股票名称] 从实时行情获取: {stock_code} -> {name}")
+                        return name
+                continue
+
+            fetcher_name = FETCHER_SOURCE_ALIASES.get(source)
+            fetcher = next((item for item in self._fetchers if item.name == fetcher_name), None)
+            if fetcher and hasattr(fetcher, 'get_stock_name'):
                 try:
                     name = fetcher.get_stock_name(stock_code)
                     if name:
@@ -1089,7 +1192,9 @@ class DataFetcherManager:
 
     def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
         """获取主要指数实时行情（自动切换数据源）"""
-        for fetcher in self._fetchers:
+        from src.config import get_config
+
+        for fetcher in self._ordered_fetchers(getattr(get_config(), 'main_index_source_priority', 'akshare,yfinance')):
             try:
                 data = fetcher.get_main_indices(region=region)
                 if data:
@@ -1102,7 +1207,9 @@ class DataFetcherManager:
 
     def get_market_stats(self) -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
-        for fetcher in self._fetchers:
+        from src.config import get_config
+
+        for fetcher in self._ordered_fetchers(getattr(get_config(), 'market_stats_source_priority', 'akshare')):
             try:
                 data = fetcher.get_market_stats()
                 if data:
@@ -1115,7 +1222,9 @@ class DataFetcherManager:
 
     def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
-        for fetcher in self._fetchers:
+        from src.config import get_config
+
+        for fetcher in self._ordered_fetchers(getattr(get_config(), 'sector_ranking_source_priority', 'akshare')):
             try:
                 data = fetcher.get_sector_rankings(n)
                 if data:

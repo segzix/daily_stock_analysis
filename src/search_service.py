@@ -6,9 +6,13 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
+2. 支持 Bocha、Tavily、Brave、SerpAPI、MiniMax、SearXNG、Bing、Google CSE、
+   DuckDuckGo 等多种搜索引擎
 3. 多 Key 负载均衡和故障转移
-4. 搜索结果缓存和格式化
+4. 配额耗尽熔断（quota-exhausted circuit breaker）：检测到 quota / rate-limit
+   错误后，本次运行内自动跳过该 provider，避免重复浪费请求
+5. 多维度情报搜索内置 per-dim fallback：单个 provider 失败时自动切到下一个
+6. 搜索结果缓存和格式化
 """
 
 import logging
@@ -134,6 +138,38 @@ class SearchResponse:
         return "\n".join(lines)
 
 
+# Quota / rate-limit error fingerprints (lower-cased substrings).
+# When matched in an error message, the provider is flagged as quota-exhausted
+# and skipped for the rest of the current run (until cooldown expires).
+_QUOTA_ERROR_PATTERNS = (
+    "exceeds your plan",
+    "usage limit",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "quota exceeded",
+    "quota_exceeded",
+    "out of credits",
+    "monthly limit",
+    "daily limit",
+    "too many requests",
+    "http 429",
+    "status 429",
+    "status_code: 429",
+    "429 client error",
+    "402 client error",
+    "403 forbidden",  # Some APIs use 403 for quota
+)
+
+
+def _is_quota_error_message(error_msg: Optional[str]) -> bool:
+    """Return True if *error_msg* looks like a quota / rate-limit error."""
+    if not error_msg:
+        return False
+    msg = error_msg.lower()
+    return any(pattern in msg for pattern in _QUOTA_ERROR_PATTERNS)
+
+
 class BaseSearchProvider(ABC):
     """搜索引擎基类"""
     
@@ -150,6 +186,30 @@ class BaseSearchProvider(ABC):
         self._key_cycle = cycle(api_keys) if api_keys else None
         self._key_usage: Dict[str, int] = {key: 0 for key in api_keys}
         self._key_errors: Dict[str, int] = {key: 0 for key in api_keys}
+        # Quota-exhausted circuit breaker: provider-wide unavailability window.
+        # When set in the future, ``is_available`` returns False until the
+        # timestamp passes, which makes SearchService skip this provider
+        # entirely for subsequent dimensions in the same run.
+        self._quota_exhausted_until: float = 0.0
+
+    # Default cooldown when provider's quota is exhausted (1 hour).
+    # During cooldown, ``is_available`` returns False so SearchService skips it.
+    # Subclasses can override this value (e.g. DuckDuckGo uses a shorter
+    # cooldown because its rate limits are short-lived).
+    _QUOTA_COOLDOWN_SECONDS = 3600
+
+    def _mark_quota_exhausted(self, ttl: Optional[int] = None) -> None:
+        """Flag the provider as quota-exhausted for *ttl* seconds.
+
+        After this call, ``is_available`` returns False until cooldown expires,
+        allowing SearchService to transparently skip the provider for the rest
+        of the run instead of repeatedly retrying a doomed call.
+        """
+        cooldown = ttl if ttl is not None else self._QUOTA_COOLDOWN_SECONDS
+        self._quota_exhausted_until = time.time() + cooldown
+        logger.warning(
+            f"[{self._name}] 配额耗尽熔断已触发，{cooldown}s 内将跳过该数据源"
+        )
     
     @property
     def name(self) -> str:
@@ -157,8 +217,13 @@ class BaseSearchProvider(ABC):
     
     @property
     def is_available(self) -> bool:
-        """检查是否有可用的 API Key"""
-        return bool(self._api_keys)
+        """检查是否有可用的 API Key 且未触发配额熔断"""
+        if not self._api_keys:
+            return False
+        # If quota cooldown is active, mark as unavailable
+        if self._quota_exhausted_until and time.time() < self._quota_exhausted_until:
+            return False
+        return True
     
     def _get_next_key(self) -> Optional[str]:
         """
@@ -187,6 +252,8 @@ class BaseSearchProvider(ABC):
         # 成功后减少错误计数
         if key in self._key_errors and self._key_errors[key] > 0:
             self._key_errors[key] -= 1
+        # Successful call clears any quota-exhausted flag (provider has recovered)
+        self._quota_exhausted_until = 0.0
     
     def _record_error(self, key: str) -> None:
         """记录错误"""
@@ -198,7 +265,7 @@ class BaseSearchProvider(ABC):
         """执行搜索（子类实现）"""
         pass
     
-    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs) -> SearchResponse:
         """
         执行搜索
         
@@ -210,6 +277,18 @@ class BaseSearchProvider(ABC):
         Returns:
             SearchResponse 对象
         """
+        # Short-circuit if provider is currently in quota-exhausted cooldown.
+        # SearchService normally filters by ``is_available`` before calling
+        # search(), but defensive check here protects callers that bypass it.
+        if self._quota_exhausted_until and time.time() < self._quota_exhausted_until:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 处于配额耗尽熔断状态",
+            )
+
         api_key = self._get_next_key()
         if not api_key:
             return SearchResponse(
@@ -222,7 +301,7 @@ class BaseSearchProvider(ABC):
         
         start_time = time.time()
         try:
-            response = self._do_search(query, api_key, max_results, days=days)
+            response = self._do_search(query, api_key, max_results, days=days, **kwargs)
             response.search_time = time.time() - start_time
             
             if response.success:
@@ -230,6 +309,11 @@ class BaseSearchProvider(ABC):
                 logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
             else:
                 self._record_error(api_key)
+                # Detect quota-exhausted patterns in the error message and
+                # trip the provider-level circuit breaker so we stop wasting
+                # request budget on subsequent dimensions in this run.
+                if _is_quota_error_message(response.error_message):
+                    self._mark_quota_exhausted()
             
             return response
             
@@ -237,6 +321,9 @@ class BaseSearchProvider(ABC):
             self._record_error(api_key)
             elapsed = time.time() - start_time
             logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
+            # Same quota detection on raised exceptions
+            if _is_quota_error_message(str(e)):
+                self._mark_quota_exhausted()
             return SearchResponse(
                 query=query,
                 results=[],
@@ -312,10 +399,15 @@ class TavilySearchProvider(BaseSearchProvider):
             
         except Exception as e:
             error_msg = str(e)
-            # 检查是否是配额问题
-            if 'rate limit' in error_msg.lower() or 'quota' in error_msg.lower():
+            # Detect quota-related failures and trip the circuit breaker.
+            # Common Tavily quota errors include 432 / "exceeds your plan's set
+            # usage limit". Once detected, ``_mark_quota_exhausted`` makes
+            # ``is_available`` return False so SearchService will skip Tavily
+            # for the rest of this run.
+            if _is_quota_error_message(error_msg):
                 error_msg = f"API 配额已用尽: {error_msg}"
-            
+                self._mark_quota_exhausted()
+
             return SearchResponse(
                 query=query,
                 results=[],
@@ -1149,6 +1241,34 @@ class SearXNGSearchProvider(BaseSearchProvider):
     def __init__(self, base_urls: List[str]):
         super().__init__(base_urls, "SearXNG")
 
+    def check_proxy_ok(self, base_url: str, max_wait: int = 60, retry_interval: int = 10) -> bool:
+        """Check whether SearXNG can reach the internet via its proxy.
+        
+        Does a lightweight search; if ALL backend engines fail with
+        timeout/CAPTCHA, the proxy is probably down.  Waits and retries
+        up to *max_wait* seconds.
+        """
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            resp = self._do_search("hello", base_url, max_results=1, days=30)
+            if resp.success and resp.results:
+                logger.info(f"[SearXNG] 代理连通性检查通过 ({len(resp.results)} 条结果)")
+                return True
+
+            unresponsive = []
+            if resp.error_message and "所有后端搜索引擎" in resp.error_message:
+                delay = min(retry_interval, deadline - time.time())
+                if delay > 0:
+                    logger.warning(
+                        f"[SearXNG] 代理似乎不通（引擎全部超时/失败），{delay:.0f}s 后重试..."
+                    )
+                    time.sleep(delay)
+                    continue
+            # Non-proxy error (e.g. HTTP 403, JSON parse failure) – don't keep retrying
+            break
+        logger.warning(f"[SearXNG] 代理连通性检查失败，{max_wait}s 内未恢复")
+        return False
+
     @staticmethod
     def _parse_http_error(response) -> str:
         """Parse HTTP error details for easier diagnostics."""
@@ -1171,42 +1291,166 @@ class SearXNGSearchProvider(BaseSearchProvider):
             return f"HTTP {response.status_code}: {body[:200]}"
 
     def _do_search(  # type: ignore[override]
-        self, query: str, base_url: str, max_results: int, days: int = 7
+        self, query: str, base_url: str, max_results: int, days: int = 7,
+        engines: Optional[List[str]] = None,
     ) -> SearchResponse:
         """Execute SearXNG search."""
-        try:
-            base = base_url.rstrip("/")
-            search_url = base if base.endswith("/search") else base + "/search"
+        base = base_url.rstrip("/")
+        search_url = base if base.endswith("/search") else base + "/search"
 
-            if days <= 1:
-                time_range = "day"
-            elif days <= 7:
-                time_range = "week"
-            elif days <= 30:
-                time_range = "month"
-            else:
-                time_range = "year"
+        if days <= 1:
+            time_range = "day"
+        elif days <= 7:
+            time_range = "week"
+        elif days <= 30:
+            time_range = "month"
+        else:
+            time_range = "year"
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            }
-            params = {
-                "q": query,
-                "format": "json",
-                "time_range": time_range,
-                "pageno": 1,
-            }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        params = {
+            "q": query,
+            "format": "json",
+            "time_range": time_range,
+            "pageno": 1,
+        }
+        if engines:
+            params["engines"] = ",".join(engines)
 
-            response = _get_with_retry(search_url, headers=headers, params=params, timeout=10)
+        for attempt in range(2):
+            if attempt > 0:
+                time.sleep(3)
+                logger.info(f"[{self.name}] 0 结果重试 (attempt {attempt + 1})...")
 
-            if response.status_code != 200:
-                error_msg = self._parse_http_error(response)
-                if response.status_code == 403:
-                    error_msg = (
-                        f"{error_msg}；SearXNG 实例可能未启用 JSON 输出（请检查 settings.yml），"
-                        "或实例/代理拒绝了本次访问"
+            try:
+                response = _get_with_retry(search_url, headers=headers, params=params, timeout=10)
+
+                if response.status_code != 200:
+                    error_msg = self._parse_http_error(response)
+                    if response.status_code == 403:
+                        error_msg = (
+                            f"{error_msg}；SearXNG 实例可能未启用 JSON 输出（请检查 settings.yml），"
+                            "或实例/代理拒绝了本次访问"
+                        )
+                    return SearchResponse(
+                        query=query,
+                        results=[],
+                        provider=self.name,
+                        success=False,
+                        error_message=error_msg,
                     )
+
+                try:
+                    data = response.json()
+                except Exception:
+                    return SearchResponse(
+                        query=query,
+                        results=[],
+                        provider=self.name,
+                        success=False,
+                        error_message="响应JSON解析失败",
+                    )
+
+                if not isinstance(data, dict):
+                    return SearchResponse(
+                        query=query,
+                        results=[],
+                        provider=self.name,
+                        success=False,
+                        error_message="响应格式无效",
+                    )
+
+                raw = data.get("results", [])
+                if not isinstance(raw, list):
+                    raw = []
+
+                results = []
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    url_val = item.get("url")
+                    if not url_val:
+                        continue
+                    raw_published_date = item.get("publishedDate")
+
+                    snippet = (item.get("content") or item.get("description") or "")[:500]
+                    published_date = None
+                    if raw_published_date:
+                        try:
+                            dt = datetime.fromisoformat(raw_published_date.replace("Z", "+00:00"))
+                            published_date = dt.strftime("%Y-%m-%d")
+                        except (ValueError, AttributeError):
+                            published_date = raw_published_date
+
+                    results.append(
+                        SearchResult(
+                            title=item.get("title", ""),
+                            snippet=snippet,
+                            url=url_val,
+                            source=self._extract_domain(url_val),
+                            published_date=published_date,
+                        )
+                    )
+                    if len(results) >= max_results:
+                        break
+
+                if results:
+                    return SearchResponse(query=query, results=results, provider=self.name, success=True)
+
+                unresponsive = data.get("unresponsive_engines", [])
+                if not unresponsive:
+                    error_msg = "搜索无结果（可能关键词不匹配或后端引擎无响应）"
+                    return SearchResponse(
+                        query=query, results=[], provider=self.name,
+                        success=False, error_message=error_msg,
+                    )
+
+                if attempt < 1:
+                    continue
+
+                flat_names = [
+                    (e[0] if (isinstance(e, list) and e) else str(e))
+                    for e in unresponsive
+                ]
+                failed_list = ", ".join(flat_names[:5])
+                error_msg = (
+                    f"所有后端搜索引擎均超时或失败: {failed_list}"
+                    "（请检查网络/代理配置）"
+                )
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False, error_message=error_msg,
+                )
+
+            except requests.exceptions.Timeout:
+                if attempt < 1:
+                    continue
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message="请求超时",
+                )
+            except requests.exceptions.RequestException as e:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"请求异常: {str(e)}",
+                )
+            except Exception:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message="搜索失败",
+                )
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1271,29 +1515,464 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
             return SearchResponse(query=query, results=results, provider=self.name, success=True)
 
-        except requests.exceptions.Timeout:
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extract domain from URL as source label."""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "未知来源"
+        except Exception:
+            return "未知来源"
+
+
+class BingSearchProvider(BaseSearchProvider):
+    """
+    Bing Web Search (Microsoft Azure / Bing Search v7).
+
+    Endpoint: https://api.bing.microsoft.com/v7.0/search
+    Auth: header ``Ocp-Apim-Subscription-Key``
+
+    Notes:
+    - Free tier (F1) allows ~3 queries/sec, 1000 queries/month.
+    - ``freshness`` parameter supports Day / Week / Month for time filtering.
+    - Bing Search has been announced for retirement; if the endpoint returns
+      404/410, the circuit breaker will trip and SearchService will skip it.
+    """
+
+    API_ENDPOINT = "https://api.bing.microsoft.com/v7.0/search"
+
+    def __init__(self, api_keys: List[str]):
+        super().__init__(api_keys, "Bing")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """Execute Bing Web Search API call."""
+        try:
+            headers = {
+                "Ocp-Apim-Subscription-Key": api_key,
+                "Accept": "application/json",
+            }
+
+            # Map ``days`` to Bing freshness enum
+            if days <= 1:
+                freshness = "Day"
+            elif days <= 7:
+                freshness = "Week"
+            else:
+                freshness = "Month"
+
+            params = {
+                "q": query,
+                "count": min(max(max_results, 1), 50),
+                "freshness": freshness,
+                "responseFilter": "Webpages,News",
+                "textDecorations": "false",
+                "textFormat": "Raw",
+                "mkt": "zh-CN",  # Default to Chinese market; falls back gracefully for English queries
+                "safeSearch": "Moderate",
+            }
+
+            response = _get_with_retry(
+                self.API_ENDPOINT, headers=headers, params=params, timeout=10
+            )
+
+            if response.status_code != 200:
+                error_msg = self._parse_http_error(response)
+                logger.warning(f"[Bing] 搜索失败: {error_msg}")
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=error_msg,
+                )
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"响应JSON解析失败: {e}",
+                )
+
+            logger.info(f"[Bing] 搜索完成，query='{query}'")
+
+            results: List[SearchResult] = []
+            # Prefer News results (more time-sensitive), then Webpages
+            news = (data.get("news") or {}).get("value") or []
+            web = (data.get("webPages") or {}).get("value") or []
+
+            for item in news:
+                if len(results) >= max_results:
+                    break
+                published = item.get("datePublished")
+                published_date = None
+                if published:
+                    try:
+                        dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, AttributeError):
+                        published_date = published[:10]
+
+                provider_name = ""
+                providers = item.get("provider") or []
+                if providers and isinstance(providers, list):
+                    provider_name = providers[0].get("name", "")
+
+                url_val = item.get("url", "")
+                results.append(SearchResult(
+                    title=item.get("name", ""),
+                    snippet=(item.get("description", "") or "")[:500],
+                    url=url_val,
+                    source=provider_name or self._extract_domain(url_val),
+                    published_date=published_date,
+                ))
+
+            for item in web:
+                if len(results) >= max_results:
+                    break
+                url_val = item.get("url", "")
+                published_date = None
+                date_last_crawled = item.get("dateLastCrawled")
+                if date_last_crawled:
+                    try:
+                        dt = datetime.fromisoformat(date_last_crawled.replace("Z", "+00:00"))
+                        published_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, AttributeError):
+                        published_date = date_last_crawled[:10]
+
+                results.append(SearchResult(
+                    title=item.get("name", ""),
+                    snippet=(item.get("snippet", "") or "")[:500],
+                    url=url_val,
+                    source=self._extract_domain(url_val),
+                    published_date=published_date,
+                ))
+
+            logger.info(f"[Bing] 解析得到 {len(results)} 条结果")
+
             return SearchResponse(
                 query=query,
-                results=[],
+                results=results,
                 provider=self.name,
-                success=False,
-                error_message="请求超时",
+                success=True,
+            )
+
+        except requests.exceptions.Timeout:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message="请求超时",
             )
         except requests.exceptions.RequestException as e:
             return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=f"网络请求失败: {e}",
+                query=query, results=[], provider=self.name,
+                success=False, error_message=f"网络请求失败: {e}",
             )
         except Exception as e:
             return SearchResponse(
-                query=query,
-                results=[],
-                provider=self.name,
-                success=False,
-                error_message=f"未知错误: {e}",
+                query=query, results=[], provider=self.name,
+                success=False, error_message=f"未知错误: {e}",
+            )
+
+    @staticmethod
+    def _parse_http_error(response) -> str:
+        """Parse HTTP error response from Bing API."""
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                err = response.json()
+                # Bing returns {"errors": [{"code": "...", "message": "..."}]}
+                errors = err.get("errors") or []
+                if errors and isinstance(errors, list):
+                    msg = errors[0].get("message") or errors[0].get("code")
+                    if msg:
+                        return f"HTTP {response.status_code}: {msg}"
+                return f"HTTP {response.status_code}: {err}"
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception:
+            return f"HTTP {response.status_code}"
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extract domain from URL as source label."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "未知来源"
+        except Exception:
+            return "未知来源"
+
+
+class GoogleCSESearchProvider(BaseSearchProvider):
+    """
+    Google Custom Search Engine (Programmable Search) provider.
+
+    Endpoint: https://www.googleapis.com/customsearch/v1
+    Required env: GOOGLE_CSE_API_KEYS, GOOGLE_CSE_ENGINE_ID
+
+    Free tier: 100 queries/day. The "API key" stored on this provider is
+    composed as ``"<google_api_key>::<cx_engine_id>"`` so we can keep multi-key
+    rotation while still pairing each key with its engine id (most users will
+    have a single CX though).
+    """
+
+    API_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+
+    def __init__(self, api_keys: List[str], engine_id: str):
+        # Compose key + engine_id for per-key rotation while keeping a single
+        # engine id is the common case. ``api_keys`` here are raw API keys.
+        composed_keys = [f"{k}::{engine_id}" for k in api_keys] if engine_id else api_keys
+        super().__init__(composed_keys, "GoogleCSE")
+        self._engine_id = engine_id
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """Execute Google CSE search."""
+        try:
+            # Split composed key back into raw_key + cx
+            if "::" in api_key:
+                raw_key, cx = api_key.split("::", 1)
+            else:
+                raw_key, cx = api_key, self._engine_id
+
+            if not cx:
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False,
+                    error_message="GOOGLE_CSE_ENGINE_ID 未配置",
+                )
+
+            # Map days to Google CSE ``dateRestrict`` parameter
+            if days <= 1:
+                date_restrict = "d1"
+            elif days <= 7:
+                date_restrict = "d7"
+            elif days <= 30:
+                date_restrict = "d30"
+            else:
+                date_restrict = "m12"
+
+            params = {
+                "key": raw_key,
+                "cx": cx,
+                "q": query,
+                "num": min(max(max_results, 1), 10),  # CSE caps at 10 per request
+                "dateRestrict": date_restrict,
+                "hl": "zh-CN",
+                "safe": "off",
+            }
+            headers = {"Accept": "application/json"}
+
+            response = _get_with_retry(
+                self.API_ENDPOINT, headers=headers, params=params, timeout=10
+            )
+
+            if response.status_code != 200:
+                error_msg = self._parse_http_error(response)
+                logger.warning(f"[GoogleCSE] 搜索失败: {error_msg}")
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False, error_message=error_msg,
+                )
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False, error_message=f"响应JSON解析失败: {e}",
+                )
+
+            logger.info(f"[GoogleCSE] 搜索完成，query='{query}'")
+
+            results: List[SearchResult] = []
+            for item in data.get("items", [])[:max_results]:
+                url_val = item.get("link", "")
+                # Try to pull a published date from common metatag locations
+                published_date = None
+                pagemap = item.get("pagemap") or {}
+                metatags = pagemap.get("metatags") or []
+                if metatags and isinstance(metatags, list):
+                    meta = metatags[0]
+                    raw_dt = (
+                        meta.get("article:published_time")
+                        or meta.get("og:updated_time")
+                        or meta.get("date")
+                        or meta.get("dc.date")
+                    )
+                    if raw_dt:
+                        try:
+                            dt = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+                            published_date = dt.strftime("%Y-%m-%d")
+                        except (ValueError, AttributeError):
+                            published_date = raw_dt[:10]
+
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    snippet=(item.get("snippet", "") or "")[:500],
+                    url=url_val,
+                    source=item.get("displayLink") or self._extract_domain(url_val),
+                    published_date=published_date,
+                ))
+
+            logger.info(f"[GoogleCSE] 解析得到 {len(results)} 条结果")
+
+            return SearchResponse(
+                query=query, results=results, provider=self.name, success=True,
+            )
+
+        except requests.exceptions.Timeout:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message="请求超时",
+            )
+        except requests.exceptions.RequestException as e:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=f"网络请求失败: {e}",
+            )
+        except Exception as e:
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=f"未知错误: {e}",
+            )
+
+    @staticmethod
+    def _parse_http_error(response) -> str:
+        """Parse HTTP error response from Google CSE API."""
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                err = response.json()
+                err_obj = err.get("error") or {}
+                msg = err_obj.get("message") or str(err)
+                code = err_obj.get("code") or response.status_code
+                # 429 rate-limit / 403 dailyLimitExceeded both carry "limit" in message
+                return f"HTTP {code}: {msg}"
+            return f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception:
+            return f"HTTP {response.status_code}"
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extract domain from URL as source label."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "未知来源"
+        except Exception:
+            return "未知来源"
+
+
+class DuckDuckGoSearchProvider(BaseSearchProvider):
+    """
+    DuckDuckGo (no-API-key) provider via the ``duckduckgo-search`` library.
+
+    No API key required. To fit the Base provider's "keys" model, this class
+    accepts a single sentinel key (``"duckduckgo"``) so multi-key rotation
+    machinery is satisfied without affecting behavior.
+
+    Notes:
+    - Rate-limit errors raise ``DuckDuckGoSearchException`` with the text
+      ``Ratelimit``; the base class auto-detects this and trips the circuit
+      breaker for a short window.
+    - Time filtering uses the ``timelimit`` parameter (d/w/m/y).
+    - This provider is the recommended free fallback when paid quotas are
+      exhausted.
+    """
+
+    # Shorter cooldown than paid providers because DDG rate limits clear quickly
+    _QUOTA_COOLDOWN_SECONDS = 600  # 10 minutes
+
+    def __init__(self, enabled: bool = False):
+        # Use a sentinel key so BaseSearchProvider treats us as "configured".
+        keys = ["duckduckgo"] if enabled else []
+        super().__init__(keys, "DuckDuckGo")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        """Execute DuckDuckGo search via duckduckgo-search library."""
+        try:
+            try:
+                from duckduckgo_search import DDGS
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+            except ImportError:
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False,
+                    error_message="duckduckgo-search 未安装，请运行: pip install duckduckgo-search",
+                )
+
+            # Map days to DDG ``timelimit`` codes
+            if days <= 1:
+                timelimit = "d"
+            elif days <= 7:
+                timelimit = "w"
+            elif days <= 30:
+                timelimit = "m"
+            else:
+                timelimit = "y"
+
+            results: List[SearchResult] = []
+            # Try multiple backends in order; some networks can't reach the
+            # default ``auto`` backend (which often hits Bing and may fail with
+            # TLS / connectivity issues). ``html`` and ``lite`` use DDG's own
+            # scraping endpoints which are more broadly accessible.
+            for backend in ("html", "lite", "auto"):
+                try:
+                    with DDGS(timeout=10) as ddgs:
+                        ddg_results = ddgs.text(
+                            keywords=query,
+                            region="wt-wt",
+                            safesearch="moderate",
+                            timelimit=timelimit,
+                            max_results=max_results,
+                            backend=backend,
+                        ) or []
+
+                    if ddg_results:
+                        for item in ddg_results[:max_results]:
+                            url_val = item.get("href") or item.get("url") or ""
+                            if not url_val:
+                                continue
+                            results.append(SearchResult(
+                                title=item.get("title", ""),
+                                snippet=(item.get("body", "") or item.get("snippet", "") or "")[:500],
+                                url=url_val,
+                                source=self._extract_domain(url_val),
+                                published_date=None,
+                            ))
+                        if results:
+                            break
+                except Exception:
+                    continue
+
+            if not results:
+                return SearchResponse(
+                    query=query, results=[], provider=self.name,
+                    success=False,
+                    error_message="DuckDuckGo 所有后端均搜索失败",
+                )
+
+            logger.info(f"[DuckDuckGo] 解析得到 {len(results)} 条结果")
+
+            return SearchResponse(
+                query=query, results=results, provider=self.name, success=True,
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"[DuckDuckGo] 搜索失败: {error_msg}")
+            return SearchResponse(
+                query=query, results=[], provider=self.name,
+                success=False, error_message=error_msg,
             )
 
     @staticmethod
@@ -1301,7 +1980,6 @@ class SearXNGSearchProvider(BaseSearchProvider):
         """Extract domain from URL as source label."""
         try:
             from urllib.parse import urlparse
-
             parsed = urlparse(url)
             domain = parsed.netloc.replace("www.", "")
             return domain or "未知来源"
@@ -1347,7 +2025,14 @@ class SearchService:
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
+        bing_keys: Optional[List[str]] = None,
+        google_cse_keys: Optional[List[str]] = None,
+        google_cse_engine_id: Optional[str] = None,
+        duckduckgo_enabled: bool = False,
         news_max_age_days: int = 3,
+        source_priority: str = (
+            "bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo"
+        ),
     ):
         """
         初始化搜索服务
@@ -1359,42 +2044,66 @@ class SearchService:
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
+            bing_keys: Bing Web Search v7 API Key 列表
+            google_cse_keys: Google Custom Search API Key 列表
+            google_cse_engine_id: Google Custom Search Engine ID（cx）
+            duckduckgo_enabled: 是否启用 DuckDuckGo 兜底（无需 API Key）
             news_max_age_days: 新闻最大时效（天）
+            source_priority: 搜索源优先级列表（逗号分隔）
         """
         self._providers: List[BaseSearchProvider] = []
         self.news_max_age_days = max(1, news_max_age_days)
 
-        # 初始化搜索引擎（按优先级排序）
-        # 1. Bocha 优先（中文搜索优化，AI摘要）
-        if bocha_keys:
-            self._providers.append(BochaSearchProvider(bocha_keys))
-            logger.info(f"已配置 Bocha 搜索，共 {len(bocha_keys)} 个 API Key")
+        # Lazy-build factories so we can support the unique constructor
+        # signatures of GoogleCSE (needs engine_id) and DuckDuckGo (no keys).
+        def _make_google_cse(_keys):
+            return GoogleCSESearchProvider(_keys, google_cse_engine_id or "")
 
-        # 2. Tavily（免费额度更多，每月 1000 次）
-        if tavily_keys:
-            self._providers.append(TavilySearchProvider(tavily_keys))
-            logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
+        def _make_duckduckgo(_keys):
+            return DuckDuckGoSearchProvider(enabled=True)
 
-        # 3. Brave Search（隐私优先，全球覆盖）
-        if brave_keys:
-            self._providers.append(BraveSearchProvider(brave_keys))
-            logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
+        # Tuple format: (keys_or_signal, factory_or_class, label, unit)
+        provider_factories = {
+            "bocha": (bocha_keys, BochaSearchProvider, "Bocha 搜索", "个 API Key"),
+            "tavily": (tavily_keys, TavilySearchProvider, "Tavily 搜索", "个 API Key"),
+            "brave": (brave_keys, BraveSearchProvider, "Brave 搜索", "个 API Key"),
+            "serpapi": (serpapi_keys, SerpAPISearchProvider, "SerpAPI 搜索", "个 API Key"),
+            "minimax": (minimax_keys, MiniMaxSearchProvider, "MiniMax 搜索", "个 API Key"),
+            "bing": (bing_keys, BingSearchProvider, "Bing 搜索", "个 API Key"),
+            "googlecse": (
+                google_cse_keys if google_cse_engine_id else None,
+                _make_google_cse,
+                "Google CSE 搜索",
+                "个 API Key",
+            ),
+            "searxng": (searxng_base_urls, SearXNGSearchProvider, "SearXNG 搜索", "个实例"),
+            # DuckDuckGo doesn't need keys; we represent "configured" via a
+            # one-element sentinel list when ``duckduckgo_enabled=True``.
+            "duckduckgo": (
+                ["duckduckgo"] if duckduckgo_enabled else None,
+                _make_duckduckgo,
+                "DuckDuckGo 搜索",
+                "个免 Key 数据源",
+            ),
+        }
 
-        # 4. SerpAPI 作为备选（每月 100 次）
-        if serpapi_keys:
-            self._providers.append(SerpAPISearchProvider(serpapi_keys))
-            logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
+        configured = set()
+        for source in [item.strip().lower() for item in source_priority.split(',') if item.strip()]:
+            item = provider_factories.get(source)
+            if not item:
+                continue
+            keys, provider_cls, label, unit = item
+            if keys and source not in configured:
+                self._providers.append(provider_cls(keys))
+                configured.add(source)
+                logger.info(f"已配置 {label}，共 {len(keys)} {unit}")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
-        if minimax_keys:
-            self._providers.append(MiniMaxSearchProvider(minimax_keys))
-            logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
+        for source, item in provider_factories.items():
+            keys, provider_cls, label, unit = item
+            if keys and source not in configured:
+                self._providers.append(provider_cls(keys))
+                logger.info(f"已配置 {label}，共 {len(keys)} {unit}")
 
-        # 6. SearXNG（自建实例，无配额兜底，最后兜底）
-        if searxng_base_urls:
-            self._providers.append(SearXNGSearchProvider(searxng_base_urls))
-            logger.info(f"已配置 SearXNG 搜索，共 {len(searxng_base_urls)} 个实例")
-        
         if not self._providers:
             logger.warning("未配置任何搜索引擎 API Key，新闻搜索功能将不可用")
 
@@ -1640,70 +2349,126 @@ class SearchService:
 
         if is_foreign:
             search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events", 'desc': '最新消息'},
-                {'name': 'market_analysis', 'query': f"{stock_name} analyst rating target price report", 'desc': '机构分析'},
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events",
+                 'desc': '最新消息', 'engines': ['google', 'duckduckgo']},
+                {'name': 'market_analysis', 'query': f"{stock_name} analyst rating target price report",
+                 'desc': '机构分析', 'engines': ['bing', 'google']},
                 {'name': 'risk_check', 'query': (
                     f"{stock_name} {stock_code} index performance outlook tracking error"
                     if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
-                ), 'desc': '风险排查'},
+                ), 'desc': '风险排查', 'engines': ['duckduckgo', 'bing']},
                 {'name': 'earnings', 'query': (
                     f"{stock_name} {stock_code} index performance composition outlook"
                     if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
-                ), 'desc': '业绩预期'},
+                ), 'desc': '业绩预期', 'engines': ['google', 'duckduckgo']},
                 {'name': 'industry', 'query': (
                     f"{stock_name} {stock_code} index sector allocation holdings"
                     if is_index_etf else f"{stock_name} industry competitors market share outlook"
-                ), 'desc': '行业分析'},
+                ), 'desc': '行业分析', 'engines': ['bing', 'google']},
             ]
         else:
             search_dimensions = [
-                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件", 'desc': '最新消息'},
-                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析", 'desc': '机构分析'},
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件",
+                 'desc': '最新消息', 'engines': ['google', 'duckduckgo']},
+                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析",
+                 'desc': '机构分析', 'engines': ['bing', 'google']},
                 {'name': 'risk_check', 'query': (
                     f"{stock_name} 指数走势 跟踪误差 净值 表现"
                     if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
-                ), 'desc': '风险排查'},
+                ), 'desc': '风险排查', 'engines': ['duckduckgo', 'bing']},
                 {'name': 'earnings', 'query': (
                     f"{stock_name} 指数成分 净值 跟踪表现"
                     if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
-                ), 'desc': '业绩预期'},
+                ), 'desc': '业绩预期', 'engines': ['google', 'duckduckgo']},
                 {'name': 'industry', 'query': (
                     f"{stock_name} 指数成分股 行业配置 权重"
                     if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
-                ), 'desc': '行业分析'},
+                ), 'desc': '行业分析', 'engines': ['bing', 'google']},
             ]
         
         logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
-        
-        # 轮流使用不同的搜索引擎
+
+        # Round-robin pick a *primary* provider per dimension to spread quota,
+        # then fall back to the remaining available providers in priority
+        # order if the primary returns failure. ``is_available`` already
+        # filters out providers tripped by the quota-exhausted circuit
+        # breaker, so failed providers stay skipped for the rest of this run.
         provider_index = 0
-        
+
+        # Pre-check SearXNG proxy connectivity before hammering it with 5 dimensions
+        for p in self._providers:
+            if p.name == "SearXNG" and p.is_available:
+                base_url = p._get_next_key()
+                if base_url:
+                    p.check_proxy_ok(base_url, max_wait=20, retry_interval=6)
+                break
+
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
-            
-            # 选择搜索引擎（轮流使用）
+
             available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
-                break
-            
-            provider = available_providers[provider_index % len(available_providers)]
+                logger.warning(f"[情报搜索] {dim['desc']}: 所有搜索引擎都不可用，跳过")
+                results[dim['name']] = SearchResponse(
+                    query=dim['query'], results=[], provider="None",
+                    success=False, error_message="所有搜索引擎都不可用",
+                )
+                search_count += 1
+                continue
+
+            # Build per-dim fallback chain: primary first (round-robin), then
+            # the rest preserving priority order.
+            primary = available_providers[provider_index % len(available_providers)]
             provider_index += 1
-            
-            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
-            
-            response = provider.search(dim['query'], max_results=3, days=self.news_max_age_days)
+            chain = [primary] + [p for p in available_providers if p is not primary]
+
+            response: Optional[SearchResponse] = None
+            for attempt_idx, provider in enumerate(chain):
+                # Re-check availability before each attempt — the previous
+                # attempt could have tripped this provider's circuit breaker.
+                if not provider.is_available:
+                    continue
+                if attempt_idx == 0:
+                    logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
+                else:
+                    logger.info(
+                        f"[情报搜索] {dim['desc']}: 切换到 {provider.name} 重试 "
+                        f"(第 {attempt_idx + 1} 次)"
+                    )
+
+                response = provider.search(
+                    dim['query'], max_results=3, days=self.news_max_age_days,
+                )
+                if response.success and response.results:
+                    break
+                # Log non-fatal failure so operators see the fallback path
+                logger.warning(
+                    f"[情报搜索] {dim['desc']}: {provider.name} 失败 - "
+                    f"{response.error_message}，尝试下一个"
+                )
+
+            # response is set as long as the chain wasn't entirely empty
+            if response is None:
+                response = SearchResponse(
+                    query=dim['query'], results=[], provider="None",
+                    success=False, error_message="所有可用搜索引擎均失败",
+                )
+
             results[dim['name']] = response
             search_count += 1
-            
-            if response.success:
+
+            if response.success and response.results:
                 logger.info(f"[情报搜索] {dim['desc']}: 获取 {len(response.results)} 条结果")
             else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
-            
-            # 短暂延迟避免请求过快
-            time.sleep(0.5)
-        
+                logger.warning(
+                    f"[情报搜索] {dim['desc']}: 搜索失败 - "
+                    f"{response.error_message or '无结果'}"
+                )
+
+            # Short delay to avoid hammering downstream APIs
+            time.sleep(2.0)
+
         return results
     
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
@@ -1965,11 +2730,14 @@ _search_service: Optional[SearchService] = None
 def get_search_service() -> SearchService:
     """获取搜索服务单例"""
     global _search_service
-    
+
     if _search_service is None:
         from src.config import get_config
         config = get_config()
-        
+
+        default_priority = (
+            'bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo'
+        )
         _search_service = SearchService(
             bocha_keys=config.bocha_api_keys,
             tavily_keys=config.tavily_api_keys,
@@ -1977,9 +2745,18 @@ def get_search_service() -> SearchService:
             serpapi_keys=config.serpapi_keys,
             minimax_keys=config.minimax_api_keys,
             searxng_base_urls=config.searxng_base_urls,
+            bing_keys=getattr(config, 'bing_api_keys', None) or [],
+            google_cse_keys=getattr(config, 'google_cse_api_keys', None) or [],
+            google_cse_engine_id=getattr(config, 'google_cse_engine_id', None) or '',
+            duckduckgo_enabled=getattr(config, 'duckduckgo_enabled', False),
             news_max_age_days=config.news_max_age_days,
+            source_priority=getattr(
+                config,
+                'news_search_source_priority',
+                default_priority,
+            ),
         )
-    
+
     return _search_service
 
 

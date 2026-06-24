@@ -1,4 +1,4 @@
-{% from '_macros.j2' import market_snapshot %}
+{% from '_macros.j2' import market_snapshot, render_backtests %}
 # 🎯 {{ report_date }} 决策仪表盘
 
 > 共分析 **{{ results|length }}** 只股票 | 🟢买入:{{ buy_count }} 🟡观望:{{ hold_count }} 🔴卖出:{{ sell_count }}
@@ -8,6 +8,8 @@
 {% for e in enriched %}
 {{ e.signal_emoji }} **{{ e.stock_name }}({{ e.result.code }})**: {{ e.result.operation_advice }} | 评分 {{ e.result.sentiment_score }} | {{ e.result.trend_prediction }}
 {% endfor %}
+
+{{ render_backtests(analysis_backtests, quant_backtests) }}
 
 ---
 {% if not summary_only %}

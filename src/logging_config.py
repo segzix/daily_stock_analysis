@@ -15,7 +15,7 @@ import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(pathname)s:%(lineno)d | %(message)s"
@@ -48,6 +48,26 @@ DEFAULT_QUIET_LOGGERS = [
     'httpx',
 ]
 
+THIRD_PARTY_LOGGERS_TO_MUTE_CONSOLE = [
+    'LiteLLM',
+    'litellm',
+]
+
+
+class _ModuleLevelFilter(logging.Filter):
+    """Allow INFO+ only from whitelisted modules; WARNING+ from all others."""
+
+    def __init__(self, info_modules: Set[str]):
+        super().__init__()
+        self._info_modules = info_modules
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        if record.levelno < logging.INFO:
+            return False
+        return record.name in self._info_modules or record.module in self._info_modules
+
 
 def setup_logging(
     log_prefix: str = "app",
@@ -55,6 +75,7 @@ def setup_logging(
     console_level: Optional[int] = None,
     debug: bool = False,
     extra_quiet_loggers: Optional[List[str]] = None,
+    console_info_modules: Optional[Set[str]] = None,
 ) -> None:
     """
     统一的日志系统初始化
@@ -102,6 +123,9 @@ def setup_logging(
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(rel_formatter)
+
+    if console_info_modules:
+        console_handler.addFilter(_ModuleLevelFilter(console_info_modules))
     root_logger.addHandler(console_handler)
 
     # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
@@ -132,7 +156,17 @@ def setup_logging(
         quiet_loggers.extend(extra_quiet_loggers)
 
     for logger_name in quiet_loggers:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+        lg = logging.getLogger(logger_name)
+        lg.setLevel(logging.WARNING)
+        lg.propagate = True
+        lg.handlers = [h for h in lg.handlers if not isinstance(h, logging.StreamHandler)]
+
+    for logger_name in THIRD_PARTY_LOGGERS_TO_MUTE_CONSOLE:
+        lg = logging.getLogger(logger_name)
+        lg.propagate = True
+        lg.handlers = [h for h in lg.handlers if not isinstance(h, logging.StreamHandler)]
+        if lg.level < logging.WARNING:
+            lg.setLevel(logging.NOTSET)
 
     # 输出初始化完成信息（使用相对路径）
     try:

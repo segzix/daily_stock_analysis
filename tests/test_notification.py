@@ -221,6 +221,45 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("600519", out)
 
     @mock.patch("src.notification.get_config")
+    def test_dashboard_report_includes_standalone_backtest_section(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(backtest_enabled=False, quant_backtest_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600519",
+            name="贵州茅台",
+            sentiment_score=72,
+            trend_prediction="看多",
+            operation_advice="持有",
+            analysis_summary="稳健",
+        )
+
+        out = service.generate_dashboard_report([result])
+
+        self.assertIn("## 📈 回测验证", out)
+        self.assertIn("AI历史回测", out)
+        self.assertIn("量化策略回测", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_single_stock_pipeline_trace_includes_backtest_effectiveness(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(backtest_enabled=False, quant_backtest_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600519",
+            name="贵州茅台",
+            sentiment_score=72,
+            trend_prediction="看多",
+            operation_advice="持有",
+            analysis_summary="稳健",
+        )
+
+        out = service.generate_single_stock_report(result)
+
+        self.assertIn("管线追踪", out)
+        self.assertIn("回测验证", out)
+        self.assertIn("AI 历史回测未启用", out)
+        self.assertIn("量化回测未启用", out)
+
+    @mock.patch("src.notification.get_config")
     def test_history_compare_context_uses_cache(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config(report_history_compare_n=3)
         service = NotificationService()

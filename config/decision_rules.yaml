@@ -1,0 +1,31 @@
+# Decision rule defaults. Keep this file conservative: rules only cap risk, they do not create buy signals.
+min_trades: 5
+max_drawdown_high_pct: 30
+max_bias_pct: 5
+sample_too_small_max_decision: hold
+underperform_max_decision: hold
+high_risk_max_decision: hold
+data_missing_max_decision: hold
+backtest_inconsistent_max_decision: hold
+dual_underperform_max_decision: hold
+max_position_size_when_constrained: 0.1
+
+guardrail_prompt_template: |
+  ---
+
+  ## 🧯 决策风控硬约束（系统规则，必须优先于 AI 判断）
+
+  | 项目 | 约束 |
+  |------|------|
+  | 股票代码 | {code} |
+  | 最高允许决策 | {decision_guardrail} |
+  | 最高建议仓位 | {position_text} |
+  | 风险标签 | {risk_flags} |
+
+  ### 必须在最终结论中明确说明
+  {mention_lines}
+
+  ### 输出限制
+  - 如果最高允许决策不是“买入”，`decision_type` 不得输出 `buy`，`operation_advice` 不得输出“买入/加仓/强烈买入”。
+  - 如果设置了最高建议仓位，持仓建议不得超过该仓位上限。
+  - 如果量化约束与短线信号冲突，最终结论必须以风控约束为准。

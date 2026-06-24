@@ -31,15 +31,17 @@
 | 模块 | 功能 | 说明 |
 |------|------|------|
 | AI | 决策仪表盘 | 一句话核心结论 + 精确买卖点位 + 操作检查清单 |
-| 分析 | 多维度分析 | 技术面（盘中实时 MA/多头排列）+ 筹码分布 + 舆情情报 + 实时行情 |
+| 分析 | 多维度分析 | 技术面（盘中实时 MA/多头排列）+ 筹码分布（支持最近成功缓存兜底）+ 舆情情报 + 实时行情 |
 | 市场 | 全球市场 | 支持 A股、港股、美股及美股指数（SPX、DJI、IXIC 等） |
 | 策略 | 市场策略系统 | 内置 A股「三段式复盘策略」与美股「Regime Strategy」，输出进攻/均衡/防守或 risk-on/neutral/risk-off 计划，并附“仅供参考，不构成投资建议”提示 |
 | 复盘 | 大盘复盘 | 每日市场概览、板块涨跌；支持 cn(A股)/us(美股)/both(两者) 切换 |
+| 行动清单 | 股票池执行计划 | 股票池分析完成后生成“今日可执行 / 等待确认 / 禁止追高或剔除”清单，包含空仓/持仓动作、买点、止损、目标价和仓位建议 |
 | 智能导入 | 多源导入 | 支持图片、CSV/Excel 文件、剪贴板粘贴；Vision LLM 提取代码+名称；置信度分层确认；名称→代码解析（本地+拼音+AkShare） |
 | 回测 | AI 回测验证 | 自动评估历史分析准确率，方向胜率、止盈止损命中率 |
 | **Agent 问股** | **策略对话** | **多轮策略问答，支持均线金叉/缠论/波浪等 11 种内置策略，Web/Bot/API 全链路** |
 | 推送 | 多渠道通知 | 企业微信、飞书、Telegram、钉钉、邮件、Pushover |
 | 自动化 | 定时运行 | GitHub Actions 定时执行，无需服务器 |
+| 搜索容错 | 多搜索源 + 配额熔断 | 9 个搜索源（Tavily/SerpAPI/Bocha/Brave/MiniMax/SearXNG/Bing/Google CSE/DuckDuckGo），单 provider 配额耗尽自动熔断、维度内 fallback 到下一个，避免重复浪费 |
 
 > 历史报告详情会优先展示 AI 返回的原始「狙击点位」文本，避免区间价、条件说明等复杂内容在历史回看时被压缩成单个数字。
 
@@ -49,9 +51,149 @@
 |------|------|
 | AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通义千问、Claude 等（统一通过 [LiteLLM](https://github.com/BerriAI/litellm) 调用，支持多 Key 负载均衡）|
 | 行情数据 | AkShare、Tushare、Pytdx、Baostock、YFinance |
-| 新闻搜索 | Tavily、SerpAPI、Bocha、Brave、MiniMax |
+| 筹码分布 | 今日缓存优先；远程优先 Tushare Pro `cyq_perf`（需权限），AkShare 东方财富 `stock_cyq_em` 作为免费兜底 |
+| 新闻搜索 | Tavily、SerpAPI、Bocha、Brave、MiniMax、SearXNG、Bing、Google CSE、DuckDuckGo |
 
 > 注：美股历史数据与实时行情统一使用 YFinance，确保复权一致性
+
+### AkShare + vectorbt 本地回测
+
+本仓库提供最小可运行的 A 股本地回测链路，适合在 conda 虚拟环境中快速验证 AKShare 数据获取与 vectorbt 策略回测：
+
+```bash
+python src/run_analysis.py
+python src/run_stock_pool_backtest.py
+python src/daily_report.py
+python src/parameter_search.py
+```
+
+相关文件：
+
+| 文件 | 说明 |
+|------|------|
+| `src/data_fetcher.py` | 使用 AKShare 获取 A 股日线并缓存为 Parquet |
+| `src/backtest.py` | 使用 vectorbt 执行 MA 均线交叉回测 |
+| `src/daily_report.py` | 生成单股票 Markdown 报告和 HTML 图表 |
+| `src/parameter_search.py` | 扫描 MA 参数并输出 CSV |
+| `src/run_analysis.py` | 一条命令完成数据获取、日报生成和参数扫描 |
+| `src/run_stock_pool_backtest.py` | 读取 `stock_pool.txt` 批量运行回测并输出股票池汇总 CSV/JSON |
+| `src/export_cloud_backtest.py` | 导出聚宽 JoinQuant 手动回测脚本和云端结果回填模板 |
+| `src/compare_backtest_results.py` | 对比本地 vectorbt 和云端手动回填结果，输出一致性报告 |
+| `src/render_decision_report.py` | 从分析结果 JSON 渲染每日行动清单 Markdown/JSON |
+| `src/services/strategy_backtest_service.py` | 生成供报告、WebUI、通知和 AI 解读消费的标准回测摘要 JSON |
+| `stock_pool.txt` | 示例股票池，后续可扩展为批量分析入口 |
+
+数据获取支持普通 A 股代码与带交易所后缀的代码，例如：
+
+```text
+000001
+600519
+159115.SZ
+```
+
+股票池批量回测默认使用命令行传入的统一区间；若个别标的上市较晚或需要特殊区间，可在 `stock_pool.txt` 中使用可选格式：
+
+```text
+000001
+600519
+159115.SZ,20250601,20260605
+```
+
+其中 ETF 会优先使用 AKShare ETF 历史行情接口，东方财富失败时使用新浪 ETF 历史行情兜底。
+
+可选择将量化回测摘要注入 LLM/DeepSeek prompt，使其影响核心结论、操作点位和持仓建议：
+
+```bash
+QUANT_BACKTEST_PROMPT_ENABLED=true python src/inspect_quant_prompt.py
+```
+
+配置项：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `QUANT_BACKTEST_ENABLED` | `false` | 是否启用本地量化回测模块入口（默认不改变主流程） |
+| `QUANT_BACKTEST_AUTO_RUN` | `false` | 是否在摘要缺失或过期时自动运行股票池回测 |
+| `QUANT_BACKTEST_PROMPT_ENABLED` | `false` | 是否把 `stock_pool_backtest_summary.json` 中对应股票的回测摘要注入 LLM prompt |
+| `QUANT_BACKTEST_SUMMARY_PATH` | `reports/stock_pool_backtest_summary.json` | 回测摘要 JSON 路径 |
+| `QUANT_BACKTEST_USE_STOCK_LIST` | `true` | 是否使用 `.env` 的 `STOCK_LIST` 作为本地/云端量化股票池 |
+| `QUANT_BACKTEST_STOCK_POOL_PATH` | `stock_pool.txt` | 股票池文件路径 |
+| `QUANT_BACKTEST_STALE_HOURS` | `24` | 摘要超过多少小时视为过期，供自动运行逻辑使用 |
+| `QUANT_BACKTEST_LOOKBACK_YEARS` | `0` | 大于 0 时，本地/云端回测自动用“当前日期往前 N 年”作为区间 |
+| `QUANT_BACKTEST_START_DATE` | `20200101` | 自动运行本地量化回测时使用的开始日期 |
+| `QUANT_BACKTEST_END_DATE` | `20240501` | 自动运行本地量化回测时使用的结束日期 |
+| `QUANT_BACKTEST_FAST_WINDOW` | `5` | 自动运行本地量化回测时使用的快线 MA 窗口 |
+| `QUANT_BACKTEST_SLOW_WINDOW` | `20` | 自动运行本地量化回测时使用的慢线 MA 窗口 |
+| `QUANT_BACKTEST_DATA_SOURCE` | `akshare` | 本地 vectorbt 回测历史行情源，可选 `akshare` 或 `joinquant` |
+| `JOINQUANT_USERNAME` | - | `QUANT_BACKTEST_DATA_SOURCE=joinquant` 时用于 `jqdatasdk` 登录 |
+| `JOINQUANT_PASSWORD` | - | `QUANT_BACKTEST_DATA_SOURCE=joinquant` 时用于 `jqdatasdk` 登录 |
+| `CLOUD_BACKTEST_ENABLED` | `false` | 是否启用云端回测结果加载入口 |
+| `CLOUD_BACKTEST_PROVIDER` | `joinquant` | 云端回测平台标识 |
+| `CLOUD_BACKTEST_SUMMARY_PATH` | `reports/cloud_backtest_summary.json` | 云端回测结果 JSON 路径 |
+| `BACKTEST_COMPARE_ENABLED` | `false` | 是否启用本地/云端回测一致性检查入口 |
+| `BACKTEST_COMPARISON_PATH` | `reports/backtest_comparison.json` | 本地/云端对比结果 JSON 路径 |
+| `BACKTEST_COMPARE_MAX_RETURN_DIFF_PCT` | `5` | 本地/云端策略收益或基准收益最大允许差异 |
+| `BACKTEST_COMPARE_MAX_DRAWDOWN_DIFF_PCT` | `5` | 本地/云端最大回撤最大允许差异 |
+| `BACKTEST_COMPARE_MAX_TRADE_COUNT_DIFF` | `3` | 本地/云端交易次数最大允许差异 |
+| `DECISION_RULE_ENABLED` | `false` | 是否启用决策风控规则入口 |
+| `DECISION_RULE_CONFIG_PATH` | `config/decision_rules.yaml` | 决策风控规则配置路径 |
+| `DECISION_REPORT_ENABLED` | `false` | 是否启用每日行动清单入口 |
+| `DECISION_REPORT_TYPE` | `daily_action_list` | 决策报告类型 |
+| `DECISION_REPORT_OUTPUT_PATH` | `reports/daily_decision_report.md` | 决策报告输出路径 |
+
+开启后，prompt 会要求模型在最终建议中考虑收益、基准收益、最大回撤、夏普、交易次数、风险等级和样本不足等约束。
+`QUANT_BACKTEST_ENABLED=true` 时，主流程会在个股分析前检查本地量化摘要；若摘要缺失或过期且 `QUANT_BACKTEST_AUTO_RUN=true`，会自动运行股票池回测生成摘要。云端回测、对比检查、决策风控和行动清单开关当前作为后续模块入口，默认关闭，不影响原有 `.env` 一键运行体验。
+如果希望使用聚宽行情做本地 vectorbt 回测，可安装 `jqdatasdk` 并设置 `QUANT_BACKTEST_DATA_SOURCE=joinquant`、`JOINQUANT_USERNAME`、`JOINQUANT_PASSWORD`；该模式只替换本地回测行情源，不自动调用聚宽云端回测任务。
+开启 `DECISION_RULE_ENABLED=true` 后，系统会基于 `config/decision_rules.yaml` 对样本不足、跑输基准、高回撤、乖离率过高和数据缺失等场景生成硬约束，并在 LLM 输出越界时自动降级为更保守建议。
+
+可导出聚宽 JoinQuant 手动回测脚本，用于独立校验本地 vectorbt 结果。导出命令只读取本地 `stock_pool.txt` 和配置参数，不访问外部行情数据源：
+
+```bash
+python src/export_cloud_backtest.py --platform joinquant --strategy ma_cross
+```
+
+输出文件位于 `exports/joinquant/`，同时生成 `reports/cloud_backtest_summary.json` 回填模板。默认使用 `.env` 的 `STOCK_LIST` 作为云端导出股票池；如需单只股票自定义回测区间，可设 `QUANT_BACKTEST_USE_STOCK_LIST=false` 并维护 `stock_pool.txt`。用户可把脚本复制到聚宽免费环境运行，再把总收益、基准收益、最大回撤和交易次数填回模板，供后续本地/云端一致性检查使用。
+
+当本地摘要和云端回填结果都准备好后，可生成一致性对比报告：
+
+```bash
+python src/compare_backtest_results.py
+```
+
+默认输出 `reports/backtest_comparison.json`。云端结果缺失或未回填不会阻塞程序，只会在对应股票的 `risk_flags` 中标记 `cloud_result_missing`、`cloud_total_return_pct_missing` 等风险标签；收益、回撤和交易次数超过阈值时标记为 `inconsistent`。
+开启 `BACKTEST_COMPARE_ENABLED=true` 后，个股 Prompt 会展示本地 vectorbt、聚宽云端结果和一致性判断；若同时开启 `DECISION_RULE_ENABLED=true`，本地/云端不一致或双源都跑输基准时会把最高允许决策限制为观望。云端结果缺失只提示“校验不可用”，不会自动降级。
+开启 `DECISION_REPORT_ENABLED=true` 后，主流程会在个股分析完成后写出并推送每日行动清单，把结果分为“今日可执行 / 等待确认 / 禁止追高或剔除”，默认输出 `reports/daily_decision_report.md` 和同名 JSON。清单包含空仓/持仓动作、入场条件、理想/次优买点、止损、目标价、仓位建议和失效条件；若启用个股+大盘合并推送，行动清单会合并进同一条通知和飞书文档。
+
+`python src/run_analysis.py` 默认输出：
+
+```text
+reports/{symbol}_{end_date}_ma_report.md
+reports/{symbol}_{end_date}_ma_backtest.html
+reports/{symbol}_{end_date}_ma_param_search.csv
+reports/{symbol}_{end_date}_backtest_summary.json
+```
+
+批量股票池回测输出：
+
+```text
+reports/stock_pool_backtest_summary.csv
+reports/stock_pool_backtest_summary.json
+reports/cloud_backtest_summary.json
+reports/backtest_comparison.json
+reports/daily_decision_report.md
+reports/daily_decision_report.json
+```
+
+可用以下命令把股票池回测摘要渲染为报告预览：
+
+```bash
+python src/render_quant_report.py
+```
+
+输出：
+
+```text
+reports/quant_backtest_report_preview.md
+```
 
 ### 内置交易纪律
 
@@ -148,7 +290,13 @@
 | `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隐私优先，美股优化，多个key用逗号分隔） | 可选 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json） | 可选 |
+| `BING_API_KEYS` | [Bing Web Search v7](https://portal.azure.com/) API Keys（多个用逗号分隔，注：Bing 已宣布退役） | 可选 |
+| `GOOGLE_CSE_API_KEYS` + `GOOGLE_CSE_ENGINE_ID` | [Google Programmable Search](https://programmablesearchengine.google.com/) API Key 与引擎 ID（每天 100 次免费） | 可选 |
+| `DUCKDUCKGO_ENABLED` | 设为 `true` 启用 DuckDuckGo 免 Key 兜底（推荐作为最后一道防线） | 可选 |
+| `NEWS_SEARCH_SOURCE_PRIORITY` | 搜索源优先级，逗号分隔。默认 `bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo` | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
+| `ENABLE_CHIP_DISTRIBUTION` | 筹码分布开关；开启后优先使用今日缓存，再尝试 Tushare/AkShare 远程数据 | 可选 |
+| `CHIP_DISTRIBUTION_CACHE_TTL_DAYS` | 筹码分布最近缓存兜底天数，默认 7 | 可选 |
 | `PREFETCH_REALTIME_QUOTES` | 实时行情预取开关：设为 `false` 可禁用全市场预取（默认 `true`） | 可选 |
 | `WECHAT_MSG_TYPE` | 企微消息类型，默认 markdown，支持配置 text 类型，发送纯 markdown 文本 | 可选 |
 | `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），默认 3，避免使用过时信息 | 可选 |
@@ -195,6 +343,8 @@ cp .env.example .env && vim .env
 # 运行分析
 python main.py
 ```
+
+> 运行时业务配置以仓库根目录 `.env` 为准；当前 shell 中已有的同名环境变量不会覆盖或补充 `.env`，避免误路由到非预期模型或渠道。
 
 > Docker 部署、定时任务配置请参考 [完整指南](docs/full-guide.md)
 > 桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)

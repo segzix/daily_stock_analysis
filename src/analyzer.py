@@ -14,7 +14,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
 
 import litellm
@@ -153,6 +153,43 @@ def _build_chip_structure_from_data(chip_data: Any) -> Dict[str, Any]:
     }
 
 
+def _get_strategy_thresholds(style: str) -> dict:
+    """Return trading thresholds based on strategy style."""
+    styles = {
+        "conservative": {
+            "label": "保守",
+            "bias_threshold_pct": 5,
+            "executable_score": 65,
+            "require_bullish": True,
+            "position_max_pct": 20,
+            "buy_rule": "缩量回踩 MA5/MA10，乖离率 < 2% 最佳",
+            "sell_rule": "跌破 MA20 立即止损",
+            "trend_requirement": "多头排列（MA5>MA10>MA20）是买入必要条件",
+        },
+        "moderate": {
+            "label": "均衡",
+            "bias_threshold_pct": 7,
+            "executable_score": 55,
+            "require_bullish": False,
+            "position_max_pct": 30,
+            "buy_rule": "回踩 MA10/MA20 支撑，或放量突破 MA5 且乖离率 < 3%",
+            "sell_rule": "跌破 MA20 且量能放大时减仓",
+            "trend_requirement": "至少 MA5 > MA20，不要求严格多头排列",
+        },
+        "aggressive": {
+            "label": "进取",
+            "bias_threshold_pct": 10,
+            "executable_score": 45,
+            "require_bullish": False,
+            "position_max_pct": 40,
+            "buy_rule": "放量突破关键阻力，或回踩震荡区间下沿。可追涨强势股",
+            "sell_rule": "跌破止损位（买入价的 3-5%）或 MA20 确认破位",
+            "trend_requirement": "不要求均线多头排列，关注价格动能和成交量",
+        },
+    }
+    return styles.get(style, styles["conservative"])
+
+
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
     """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
     if not result or not chip_data:
@@ -176,6 +213,96 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
             logger.info("[chip_structure] Filled placeholder chip fields from data source (Issue #589)")
     except Exception as e:
         logger.warning("[chip_structure] Fill failed, skipping: %s", e)
+
+
+def _fill_data_perspective_from_context(result: "AnalysisResult", context: dict) -> None:
+    """Fill data_perspective from analysis context when LLM doesn't generate it."""
+    if not result or not context:
+        return
+    try:
+        dash = result.dashboard if result.dashboard else {}
+        dp = dash.get("data_perspective") or {}
+        if not isinstance(dp, dict):
+            dp = {}
+        needs_fill = not dp or not any(dp.get(k) for k in ("trend_status", "price_position", "volume_analysis"))
+        if not needs_fill and dp.get("chip_structure"):
+            return  # Already fully populated by LLM
+        if not needs_fill:
+            return
+
+        trend = context.get("trend_analysis") or {}
+        prices = (context.get("prices") or {}).get("today") or {}
+        realtime = context.get("realtime") or {}
+
+        if not dp.get("trend_status"):
+            dp["trend_status"] = {
+                "ma_alignment": trend.get("status", "未知"),
+                "is_bullish": trend.get("is_bullish", False),
+                "trend_score": trend.get("score", 0),
+            }
+        if not dp.get("price_position"):
+            current = prices.get("close", "-") or realtime.get("price", "-")
+            raw_bias = str(prices.get("bias_ma5", "")).replace("%", "").strip()
+            try:
+                bias_val = float(raw_bias)
+                bias_text = f"{bias_val:.1f}%"
+                if bias_val < 3:
+                    bias_status = "安全"
+                elif bias_val < 5:
+                    bias_status = "警戒"
+                else:
+                    bias_status = "危险"
+            except (ValueError, TypeError):
+                bias_text = "-"
+                bias_status = "未知"
+            dp["price_position"] = {
+                "current_price": current,
+                "ma5": prices.get("ma5", "-"),
+                "ma10": prices.get("ma10", "-"),
+                "ma20": prices.get("ma20", "-"),
+                "bias_ma5": bias_text,
+                "bias_status": bias_status,
+                "support_level": prices.get("ma20", "-"),
+                "resistance_level": prices.get("ma5", "-"),
+            }
+        if not dp.get("volume_analysis"):
+            vr = realtime.get("volume_ratio", "-")
+            try:
+                vr_val = float(str(vr))
+                if vr_val > 1.2:
+                    vol_status = "放量"
+                elif vr_val < 0.8:
+                    vol_status = "缩量"
+                else:
+                    vol_status = "平量"
+            except (ValueError, TypeError):
+                vol_status = "平量"
+            dp["volume_analysis"] = {
+                "volume_ratio": vr,
+                "volume_status": vol_status,
+                "turnover_rate": realtime.get("turnover_rate", "-"),
+                "volume_meaning": realtime.get("volume_ratio_desc", "数据未提供"),
+            }
+        dash["data_perspective"] = dp
+        result.dashboard = dash
+    except Exception:
+        pass
+
+
+def mark_chip_structure_missing(result: "AnalysisResult") -> None:
+    """Mark chip_structure fields as unavailable when the data source returned no chip data."""
+    if not result:
+        return
+    if not result.dashboard:
+        result.dashboard = {}
+    data_perspective = result.dashboard.get("data_perspective") or {}
+    result.dashboard["data_perspective"] = data_perspective
+    data_perspective["chip_structure"] = {
+        "profit_ratio": "数据不足",
+        "avg_cost": "数据不足",
+        "concentration": "数据不足",
+        "chip_health": "无法判断",
+    }
 
 
 def get_stock_name_multi_source(
@@ -292,6 +419,16 @@ class AnalysisResult:
     data_sources: str = ""  # 数据来源说明
     success: bool = True
     error_message: Optional[str] = None
+
+    # ========== 管线追踪（每步的成败和来源）==========
+    daily_data_source: str = ""       # 日线数据来源（如 AkshareFetcher）
+    daily_data_ok: bool = True        # 日线数据是否成功
+    realtime_source: str = ""         # 实时行情来源（如 akshare_em）
+    realtime_ok: bool = True          # 实时行情是否成功
+    chip_source: str = ""             # 筹码分布来源（如 akshare）
+    chip_ok: bool = True              # 筹码分布是否成功
+    intel_trace: List[Dict[str, Any]] = field(default_factory=list)
+    # intel_trace: [{dim, provider, success, results, error}, ...]
 
     # ========== 价格数据（分析时快照）==========
     current_price: Optional[float] = None  # 分析时的股价
@@ -429,6 +566,36 @@ class GeminiAnalyzer:
         result = analyzer.analyze(context, news_context)
     """
 
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with strategy-specific thresholds."""
+        from src.config import get_config
+        style = getattr(get_config(), "strategy_style", "conservative")
+        t = _get_strategy_thresholds(style)
+        bias_safe = max(1.0, t["bias_threshold_pct"] * 0.4)
+        bias_action = (
+            "严禁追高！直接判定为观望"
+            if style == "conservative"
+            else "谨慎介入，仅限轻仓试错"
+        )
+        replacements = {
+            "__STYLE_LABEL__": {
+                "conservative": "保守型（严进宽出，宁可错过不买错）",
+                "moderate": "均衡型（平衡风险与收益）",
+                "aggressive": "进取型（放宽趋势要求，允许追涨）",
+            }.get(style, "保守型"),
+            "__BUY_RULE__": t["buy_rule"],
+            "__BIAS_SAFE__": str(bias_safe),
+            "__BIAS_THRESHOLD_PCT__": str(t["bias_threshold_pct"]),
+            "__BIAS_ACTION__": bias_action,
+            "__TREND_REQUIREMENT__": t["trend_requirement"],
+            "__SELL_RULE__": t["sell_rule"],
+            "__POSITION_MAX_PCT__": str(t["position_max_pct"]),
+        }
+        prompt = self.SYSTEM_PROMPT
+        for key, value in replacements.items():
+            prompt = prompt.replace("{" + key + "}", value)
+        return prompt
+
     # ========================================
     # 系统提示词 - 决策仪表盘 v2.0
     # ========================================
@@ -437,19 +604,19 @@ class GeminiAnalyzer:
     # ========================================
 
     SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+当前策略风格：{__STYLE_LABEL__}
 
 ## 核心交易理念（必须严格遵守）
 
-### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
-- **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+### 1. 入场策略
+- {__BUY_RULE__}
+- 乖离率公式：(现价 - MA5) / MA5 × 100%
+- 乖离率 {__BIAS_SAFE__}%：安全区间，可正常操作
+- 乖离率 {__BIAS_SAFE__}-{__BIAS_THRESHOLD_PCT__}%：谨慎区间，可轻仓
+- 乖离率 > {__BIAS_THRESHOLD_PCT__}%：风险区间。**超过 {__BIAS_THRESHOLD_PCT__}% 时：{__BIAS_ACTION__}**
 
-### 2. 趋势交易（顺势而为）
-- **多头排列必须条件**：MA5 > MA10 > MA20
-- 只做多头排列的股票，空头排列坚决不碰
+### 2. 趋势判断
+- {__TREND_REQUIREMENT__}
 - 均线发散上行优于均线粘合
 - 趋势强度判断：看均线间距是否在扩大
 
@@ -458,10 +625,9 @@ class GeminiAnalyzer:
 - 获利比例分析：70-90% 获利盘时需警惕获利回吐
 - 平均成本与现价关系：现价高于平均成本 5-15% 为健康
 
-### 4. 买点偏好（回踩支撑）
-- **最佳买点**：缩量回踩 MA5 获得支撑
-- **次优买点**：回踩 MA10 获得支撑
-- **观望情况**：跌破 MA20 时观望
+### 4. 卖出规则
+- {__SELL_RULE__}
+- 建议仓位上限：{__POSITION_MAX_PCT__}%
 
 ### 5. 风险排查重点
 - 减持公告（股东、高管减持）
@@ -475,8 +641,8 @@ class GeminiAnalyzer:
 - PE 明显偏高时（如远超行业平均或历史均值），需在风险点中说明
 - 高成长股可适当容忍较高 PE，但需有业绩支撑
 
-### 7. 强势趋势股放宽
-- 强势趋势股（多头排列且趋势强度高、量能配合）可适当放宽乖离率要求
+### 7. 强势趋势股
+- 强势趋势股（趋势强度高、量能配合）可适当放宽乖离率要求
 - 此类股票可轻仓追踪，但仍需设置止损，不盲目追高
 
 ## 输出格式：决策仪表盘 JSON
@@ -701,6 +867,14 @@ class GeminiAnalyzer:
                 f"API key from environment)"
             )
 
+        # Confirm the model and key being used
+        _keys = get_api_keys_for_model(litellm_model, config)
+        if _keys:
+            _masked = _keys[0][:10] + "…" if len(_keys[0]) > 10 else "***"
+            logger.info(f"[LLM路由] 模型: {litellm_model} | API Key: {_masked}")
+        else:
+            logger.info(f"[LLM路由] 模型: {litellm_model} | API Key: 由环境变量/provider自动解析")
+
     def is_available(self) -> bool:
         """Check if LiteLLM is properly configured with at least one API key."""
         return self._router is not None or self._litellm_available
@@ -741,7 +915,7 @@ class GeminiAnalyzer:
                 call_kwargs: Dict[str, Any] = {
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "system", "content": self._build_system_prompt()},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": temperature,
@@ -876,6 +1050,7 @@ class GeminiAnalyzer:
         try:
             # 格式化输入（包含技术面数据和新闻）
             prompt = self._format_prompt(context, name, news_context)
+            decision_guardrails = self._build_decision_guardrails(context)
             
             config = get_config()
             model_name = config.litellm_model or "unknown"
@@ -902,9 +1077,20 @@ class GeminiAnalyzer:
             retry_count = 0
             max_retries = config.report_integrity_retry if config.report_integrity_enabled else 0
 
+            llm_retries = 0
             while True:
-                start_time = time.time()
-                response_text, model_used, llm_usage = self._call_litellm(current_prompt, generation_config)
+                try:
+                    start_time = time.time()
+                    response_text, model_used, llm_usage = self._call_litellm(current_prompt, generation_config)
+                except Exception as e:
+                    llm_retries += 1
+                    if llm_retries < 2:
+                        logger.warning(
+                            f"[LLM重试] 第1次调用失败: {e}，3秒后重试..."
+                        )
+                        time.sleep(3)
+                        continue
+                    raise
                 elapsed = time.time() - start_time
 
                 # 记录响应信息
@@ -923,6 +1109,12 @@ class GeminiAnalyzer:
                 result.search_performed = bool(news_context)
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
+                # Fill data_perspective from context when LLM skips it (e.g. deepseek-chat truncation)
+                _fill_data_perspective_from_context(result, context)
+                if 'chip' not in context:
+                    mark_chip_structure_missing(result)
+                if decision_guardrails:
+                    self._apply_decision_guardrails(result, decision_guardrails)
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -1056,6 +1248,8 @@ class GeminiAnalyzer:
 ### 筹码分布数据（效率指标）
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
+| 数据日期 | {chip.get('date', 'N/A')} | 缓存数据仅作参考 |
+| 数据来源 | {chip.get('source', 'N/A')} | source 以 cache: 开头表示接口失败后使用最近缓存 |
 | **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
 | 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
@@ -1086,6 +1280,23 @@ class GeminiAnalyzer:
 
 **风险因素**：
 {chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
+
+### MACD 与 RSI 指标
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| MACD DIF | {trend.get('macd_dif', 'N/A')} | |
+| MACD DEA | {trend.get('macd_dea', 'N/A')} | |
+| MACD BAR | {trend.get('macd_bar', 'N/A')} | {trend.get('macd_signal', 'N/A')} |
+| MACD 状态 | {trend.get('macd_status', 'N/A')} | |
+| RSI(6) | {trend.get('rsi_6', 'N/A')} | |
+| RSI(12) | {trend.get('rsi_12', 'N/A')} | |
+| RSI(24) | {trend.get('rsi_24', 'N/A')} | {trend.get('rsi_signal', 'N/A')} |
+| RSI 状态 | {trend.get('rsi_status', 'N/A')} | |
+"""
+        if 'chip' not in context:
+            prompt += """
+### 筹码分布数据（效率指标）
+筹码分布接口本次未返回有效数据。请在 JSON 的 `chip_structure` 中统一输出“数据不足/无法判断”，严禁暂估、推算或编造获利比例、平均成本、集中度等具体数值。
 """
         
         # 添加昨日对比数据
@@ -1104,7 +1315,19 @@ class GeminiAnalyzer:
 ## 📰 舆情情报
 """
         if news_context:
-            prompt += f"""
+            if context.get('is_index_etf'):
+                prompt += f"""
+以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
+1. 📢 **最新动态**：指数走势、跟踪表现、净值变化、规模变动
+2. 🚨 **风险警报**：跟踪误差扩大、市场波动、流动性风险
+3. ✨ **利好催化**：指数成分股走强、宏观利好、资金流入
+
+```
+{news_context}
+```
+"""
+            else:
+                prompt += f"""
 以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
 1. 🚨 **风险警报**：减持、处罚、利空
 2. 🎯 **利好催化**：业绩、合同、政策
@@ -1118,6 +1341,48 @@ class GeminiAnalyzer:
             prompt += """
 未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
 """
+
+        config = get_config()
+        if getattr(config, "quant_backtest_prompt_enabled", False):
+            try:
+                from src.services.quant_context_service import (
+                    format_quant_summary_for_prompt,
+                    get_quant_summary_by_code,
+                )
+
+                quant_summary = get_quant_summary_by_code(
+                    code,
+                    getattr(config, "quant_backtest_summary_path", "reports/stock_pool_backtest_summary.json"),
+                )
+                quant_prompt = format_quant_summary_for_prompt(quant_summary)
+                if quant_prompt:
+                    prompt += quant_prompt
+            except Exception as e:
+                logger.debug("Quant backtest prompt context skipped: %s", e)
+
+        if getattr(config, "backtest_compare_enabled", False):
+            try:
+                from src.services.quant_context_service import (
+                    format_backtest_comparison_for_prompt,
+                    get_backtest_comparison_by_code,
+                    get_cloud_summary_by_code,
+                )
+
+                comparison = get_backtest_comparison_by_code(
+                    code,
+                    getattr(config, "backtest_comparison_path", "reports/backtest_comparison.json"),
+                )
+                cloud_summary = get_cloud_summary_by_code(
+                    code,
+                    getattr(config, "cloud_backtest_summary_path", "reports/cloud_backtest_summary.json"),
+                )
+                prompt += format_backtest_comparison_for_prompt(comparison, cloud_summary)
+            except Exception as e:
+                logger.debug("Backtest comparison prompt context skipped: %s", e)
+
+        decision_guardrails_prompt = self._format_decision_guardrails(self._build_decision_guardrails(context))
+        if decision_guardrails_prompt:
+            prompt += decision_guardrails_prompt
 
         # 注入缺失数据警告
         if context.get('data_missing'):
@@ -1167,6 +1432,59 @@ class GeminiAnalyzer:
 请输出完整的 JSON 格式决策仪表盘。"""
         
         return prompt
+
+    def _build_decision_guardrails(self, context: Dict[str, Any]) -> Dict[str, Any] | None:
+        config = get_config()
+        if not getattr(config, "decision_rule_enabled", False):
+            return None
+
+        code = context.get('code', 'Unknown')
+        try:
+            from src.services.decision_rule_service import evaluate_decision_rules
+            from src.services.quant_context_service import get_backtest_comparison_by_code, get_quant_summary_by_code
+
+            quant_summary = get_quant_summary_by_code(
+                code,
+                getattr(config, "quant_backtest_summary_path", "reports/stock_pool_backtest_summary.json"),
+            )
+            backtest_comparison = None
+            if getattr(config, "backtest_compare_enabled", False):
+                backtest_comparison = get_backtest_comparison_by_code(
+                    code,
+                    getattr(config, "backtest_comparison_path", "reports/backtest_comparison.json"),
+                )
+            return evaluate_decision_rules(
+                code=code,
+                quant_summary=quant_summary,
+                backtest_comparison=backtest_comparison,
+                technical_context=context,
+                config_path=getattr(config, "decision_rule_config_path", "config/decision_rules.yaml"),
+            )
+        except Exception as e:
+            logger.debug("Decision rule guardrails skipped: %s", e)
+            return None
+
+    def _format_decision_guardrails(self, guardrails: Dict[str, Any] | None) -> str:
+        if not guardrails:
+            return ""
+        try:
+            from src.services.decision_rule_service import format_decision_guardrails_for_prompt
+
+            return format_decision_guardrails_for_prompt(guardrails)
+        except Exception as e:
+            logger.debug("Decision rule prompt context skipped: %s", e)
+            return ""
+
+    def _apply_decision_guardrails(self, result: AnalysisResult, guardrails: Dict[str, Any] | None) -> None:
+        if not guardrails:
+            return
+        try:
+            from src.services.decision_rule_service import apply_decision_guardrails_to_result
+
+            if apply_decision_guardrails_to_result(result, guardrails):
+                logger.info("Decision guardrails downgraded %s to %s", result.code, result.operation_advice)
+        except Exception as e:
+            logger.debug("Decision rule result guardrails skipped: %s", e)
     
     def _format_volume(self, volume: Optional[float]) -> str:
         """格式化成交量显示"""
