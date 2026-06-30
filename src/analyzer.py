@@ -437,6 +437,10 @@ class AnalysisResult:
     # ========== 模型标记（Issue #528）==========
     model_used: Optional[str] = None  # 分析使用的 LLM 模型（完整名，如 gemini/gemini-2.0-flash）
 
+    # ========== 分步分析中间结果（3-Step 模式）==========
+    step1_technical: Optional[Dict[str, Any]] = None  # Step1: 技术面趋势分析
+    step2_validation: Optional[Dict[str, Any]] = None  # Step2: 筹码+回测验证
+
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
 
@@ -921,6 +925,16 @@ class GeminiAnalyzer:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
+                if getattr(config, "debug_print_prompt", False):
+                    _sys = call_kwargs["messages"][0]["content"]
+                    _usr = call_kwargs["messages"][1]["content"]
+                    logger.warning(
+                        "\n========== DEBUG_PROMPT [model=%s] len(system)=%d len(user)=%d ==========\n"
+                        "=== SYSTEM ===\n%s\n"
+                        "=== USER ===\n%s\n"
+                        "========== DEBUG_PROMPT END ==========",
+                        model, len(_sys), len(_usr), _sys, _usr,
+                    )
                 extra = get_thinking_extra_body(model_short)
                 if extra:
                     call_kwargs["extra_body"] = extra
@@ -1048,101 +1062,74 @@ class GeminiAnalyzer:
             )
         
         try:
-            # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context)
-            decision_guardrails = self._build_decision_guardrails(context)
-            
             config = get_config()
             model_name = config.litellm_model or "unknown"
-            logger.info(f"========== AI 分析 {name}({code}) ==========")
+            logger.info(f"========== AI 分析 {name}({code}) (3-Step) ==========")
             logger.info(f"[LLM配置] 模型: {model_name}")
-            logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
-            logger.info(f"[LLM配置] 是否包含新闻: {'是' if news_context else '否'}")
 
-            # 记录完整 prompt 到日志（INFO级别记录摘要，DEBUG记录完整）
-            prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
-            logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
-            logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
+            request_delay = config.gemini_request_delay
 
-            # 设置生成配置
-            generation_config = {
-                "temperature": config.gemini_temperature,
-                "max_output_tokens": 8192,
-            }
+            # Step 1: Technical analysis (price, MA, MACD, RSI, volume)
+            if request_delay > 0:
+                time.sleep(request_delay)
+            step1_raw = self._analyze_step("Step1-技术面", self._format_step1_prompt(context, name))
+            step1_result = self._parse_step_json(step1_raw, "Step1")
 
-            logger.info(f"[LLM调用] 开始调用 {model_name}...")
-
-            # 使用 litellm 调用（支持完整性校验重试）
-            current_prompt = prompt
-            retry_count = 0
-            max_retries = config.report_integrity_retry if config.report_integrity_enabled else 0
-
-            llm_retries = 0
-            while True:
-                try:
-                    start_time = time.time()
-                    response_text, model_used, llm_usage = self._call_litellm(current_prompt, generation_config)
-                except Exception as e:
-                    llm_retries += 1
-                    if llm_retries < 2:
-                        logger.warning(
-                            f"[LLM重试] 第1次调用失败: {e}，3秒后重试..."
-                        )
-                        time.sleep(3)
-                        continue
-                    raise
-                elapsed = time.time() - start_time
-
-                # 记录响应信息
-                logger.info(
-                    f"[LLM返回] {model_name} 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
+            # Step 2: Structural validation (chip + backtest)
+            if step1_result and request_delay > 0:
+                time.sleep(request_delay)
+            step2_result = None
+            if step1_result:
+                step2_raw = self._analyze_step(
+                    "Step2-筹码回测", self._format_step2_prompt(context, name, step1_result), max_tokens=2048
                 )
-                response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
-                logger.info(f"[LLM返回 预览]\n{response_preview}")
-                logger.debug(
-                    f"=== {model_name} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
-                )
+                step2_result = self._parse_step_json(step2_raw, "Step2")
 
-                # 解析响应
+            # Step 3: Final decision (news + guardrails + all prior results)
+            if step1_result and request_delay > 0:
+                time.sleep(request_delay)
+            if step1_result:
+                step3_raw = self._analyze_step(
+                    "Step3-最终决策",
+                    self._format_step3_prompt(context, name, news_context, step1_result, step2_result or {}),
+                    max_tokens=8192,
+                )
+                result = self._parse_response(step3_raw, code, name)
+                result.step1_technical = step1_result
+                result.step2_validation = step2_result
+            else:
+                # Step 1 failed, fall back to single-call mode
+                logger.warning(f"[LLM] Step 1 失败，回退到单步模式")
+                prompt = self._format_prompt(context, name, news_context)
+                response_text, model_used, llm_usage = self._call_litellm(
+                    prompt, {"temperature": config.gemini_temperature, "max_output_tokens": 8192}
+                )
                 result = self._parse_response(response_text, code, name)
-                result.raw_response = response_text
-                result.search_performed = bool(news_context)
-                result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
-                # Fill data_perspective from context when LLM skips it (e.g. deepseek-chat truncation)
-                _fill_data_perspective_from_context(result, context)
-                if 'chip' not in context:
-                    mark_chip_structure_missing(result)
-                if decision_guardrails:
-                    self._apply_decision_guardrails(result, decision_guardrails)
+                persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
 
-                # 内容完整性校验（可选）
-                if not config.report_integrity_enabled:
-                    break
+            result.raw_response = getattr(result, 'raw_response', '')
+            result.search_performed = bool(news_context)
+            result.market_snapshot = self._build_market_snapshot(context)
+
+            # Fill data_perspective from context when LLM skips it
+            _fill_data_perspective_from_context(result, context)
+            if 'chip' not in context:
+                mark_chip_structure_missing(result)
+
+            decision_guardrails = self._build_decision_guardrails(context)
+            if decision_guardrails:
+                self._apply_decision_guardrails(result, decision_guardrails)
+
+            # Content integrity (optional)
+            if config.report_integrity_enabled:
                 pass_integrity, missing_fields = self._check_content_integrity(result)
-                if pass_integrity:
-                    break
-                if retry_count < max_retries:
-                    current_prompt = self._build_integrity_retry_prompt(
-                        prompt,
-                        response_text,
-                        missing_fields,
-                    )
-                    retry_count += 1
-                    logger.info(
-                        "[LLM完整性] 必填字段缺失 %s，第 %d 次补全重试",
-                        missing_fields,
-                        retry_count,
-                    )
-                else:
+                if not pass_integrity:
                     self._apply_placeholder_fill(result, missing_fields)
                     logger.warning(
-                        "[LLM完整性] 必填字段缺失 %s，已占位补全，不阻塞流程",
+                        "[LLM完整性] 必填字段缺失 %s，已占位补全",
                         missing_fields,
                     )
-                    break
-
-            persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
 
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
 
@@ -1201,6 +1188,32 @@ class GeminiAnalyzer:
 
 ---
 
+## 🏷️ 筹码分布（核心参考，权重最高）
+
+"""
+
+        # 筹码分布数据 — 提前到最前面，确保 LLM 优先考虑
+        if 'chip' in context:
+            chip = context['chip']
+            profit_ratio = chip.get('profit_ratio', 0)
+            prompt += f"""
+| 指标 | 数值 | 健康标准 |
+|------|------|----------|
+| 数据日期 | {chip.get('date', 'N/A')} | 缓存数据仅作参考 |
+| 数据来源 | {chip.get('source', 'N/A')} | cache: 开头表示使用缓存 |
+| **获利比例** | **{profit_ratio:.1%}** | <10%极重套牢 / 10-70%正常 / >70%获利回吐风险 |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
+| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <8%高度集中 <15%集中 |
+| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
+| 筹码状态 | {chip.get('chip_status', '未知')} | |
+"""
+        else:
+            prompt += """
+⚠️ 筹码分布数据未获取。请在 `chip_structure` 中输出"数据不足/无法判断"，严禁编造具体数值。
+"""
+        prompt += f"""
+---
+
 ## 📈 技术面数据
 
 ### 今日行情
@@ -1239,25 +1252,8 @@ class GeminiAnalyzer:
 | 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
 | 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
 """
-        
-        # 添加筹码分布数据
-        if 'chip' in context:
-            chip = context['chip']
-            profit_ratio = chip.get('profit_ratio', 0)
-            prompt += f"""
-### 筹码分布数据（效率指标）
-| 指标 | 数值 | 健康标准 |
-|------|------|----------|
-| 数据日期 | {chip.get('date', 'N/A')} | 缓存数据仅作参考 |
-| 数据来源 | {chip.get('source', 'N/A')} | source 以 cache: 开头表示接口失败后使用最近缓存 |
-| **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
-| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
-| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
-| 筹码状态 | {chip.get('chip_status', '未知')} | |
-"""
-        
-        # 添加趋势分析结果（基于交易理念的预判）
+         
+        # 添加趋势分析结果（客观数据展示）
         if 'trend_analysis' in context:
             trend = context['trend_analysis']
             bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
@@ -1293,12 +1289,7 @@ class GeminiAnalyzer:
 | RSI(24) | {trend.get('rsi_24', 'N/A')} | {trend.get('rsi_signal', 'N/A')} |
 | RSI 状态 | {trend.get('rsi_status', 'N/A')} | |
 """
-        if 'chip' not in context:
-            prompt += """
-### 筹码分布数据（效率指标）
-筹码分布接口本次未返回有效数据。请在 JSON 的 `chip_structure` 中统一输出“数据不足/无法判断”，严禁暂估、推算或编造获利比例、平均成本、集中度等具体数值。
-"""
-        
+         
         # 添加昨日对比数据
         if 'yesterday' in context:
             volume_change = context.get('volume_change_ratio', 'N/A')
@@ -1308,40 +1299,7 @@ class GeminiAnalyzer:
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
         
-        # 添加新闻搜索结果（重点区域）
-        prompt += """
----
-
-## 📰 舆情情报
-"""
-        if news_context:
-            if context.get('is_index_etf'):
-                prompt += f"""
-以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
-1. 📢 **最新动态**：指数走势、跟踪表现、净值变化、规模变动
-2. 🚨 **风险警报**：跟踪误差扩大、市场波动、流动性风险
-3. ✨ **利好催化**：指数成分股走强、宏观利好、资金流入
-
-```
-{news_context}
-```
-"""
-            else:
-                prompt += f"""
-以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
-1. 🚨 **风险警报**：减持、处罚、利空
-2. 🎯 **利好催化**：业绩、合同、政策
-3. 📊 **业绩预期**：年报预告、业绩快报
-
-```
-{news_context}
-```
-"""
-        else:
-            prompt += """
-未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
-"""
-
+        # 添加量化回测数据（提前到新闻之前，提升权重）
         config = get_config()
         if getattr(config, "quant_backtest_prompt_enabled", False):
             try:
@@ -1383,6 +1341,40 @@ class GeminiAnalyzer:
         decision_guardrails_prompt = self._format_decision_guardrails(self._build_decision_guardrails(context))
         if decision_guardrails_prompt:
             prompt += decision_guardrails_prompt
+        
+        # 添加新闻搜索结果（重点区域）
+        prompt += """
+---
+
+## 📰 舆情情报
+"""
+        if news_context:
+            if context.get('is_index_etf'):
+                prompt += f"""
+以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
+1. 📢 **最新动态**：指数走势、跟踪表现、净值变化、规模变动
+2. 🚨 **风险警报**：跟踪误差扩大、市场波动、流动性风险
+3. ✨ **利好催化**：指数成分股走强、宏观利好、资金流入
+
+```
+{news_context}
+```
+"""
+            else:
+                prompt += f"""
+以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
+1. 🚨 **风险警报**：减持、处罚、利空
+2. 🎯 **利好催化**：业绩、合同、政策
+3. 📊 **业绩预期**：年报预告、业绩快报
+
+```
+{news_context}
+```
+"""
+        else:
+            prompt += """
+ 未搜索到该股票近期的相关新闻。请主要依据技术面和筹码数据进行分析。
+"""
 
         # 注入缺失数据警告
         if context.get('data_missing'):
@@ -1419,8 +1411,9 @@ class GeminiAnalyzer:
 1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
 2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
 3. ❓ 量能是否配合（缩量回调/放量突破）？
-4. ❓ 筹码结构是否健康？
-5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+4. ❓ **筹码结构是否健康？**（获利比例 < 10% 深套 / 10-70% 正常 / > 70% 获利回吐风险；集中度 < 15% 为集中；现价与平均成本关系）
+5. ❓ **量化回测数据是否支持？**（回测有效且盈利 → 可加分；回测高风险/跑输基准 → 降级；样本不足 → 提示待验证）
+6. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
 
 ### 决策仪表盘要求：
 - **股票名称**：必须输出正确的中文全称（如"贵州茅台"而非"股票600519"）
@@ -1429,9 +1422,349 @@ class GeminiAnalyzer:
 - **具体狙击点位**：买入价、止损价、目标价（精确到分）
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
 
-请输出完整的 JSON 格式决策仪表盘。"""
+ 请输出完整的 JSON 格式决策仪表盘。"""
         
         return prompt
+
+    def _format_step1_prompt(self, context: Dict[str, Any], name: str) -> str:
+        """Step 1: Pure technical analysis — price, trend, momentum. No chip, no backtest, no news."""
+        code = context.get('code', 'Unknown')
+        stock_name = context.get('stock_name', name)
+        if not stock_name or stock_name == f'股票{code}':
+            stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
+        today = context.get('today', {})
+
+        prompt = f"""# 技术面趋势分析（第一步）
+
+## 📊 股票基础信息
+| 项目 | 数据 |
+|------|------|
+| 股票代码 | **{code}** |
+| 股票名称 | **{stock_name}** |
+| 分析日期 | {context.get('date', '未知')} |
+
+## 📈 K线与均线
+
+### 今日行情
+| 指标 | 数值 |
+|------|------|
+| 收盘价 | {today.get('close', 'N/A')} 元 |
+| 开盘价 | {today.get('open', 'N/A')} 元 |
+| 最高价 | {today.get('high', 'N/A')} 元 |
+| 最低价 | {today.get('low', 'N/A')} 元 |
+| 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
+| 成交量 | {self._format_volume(today.get('volume'))} |
+| 成交额 | {self._format_amount(today.get('amount'))} |
+
+### 均线系统
+| 均线 | 数值 | 说明 |
+|------|------|------|
+| MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
+| MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
+| MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
+| 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
+"""
+
+        # 实时行情
+        if 'realtime' in context:
+            rt = context['realtime']
+            prompt += f"""
+### 实时行情
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
+| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
+| 市净率 | {rt.get('pb_ratio', 'N/A')} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
+| 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
+"""
+
+        # 趋势分析 + MACD/RSI
+        if 'trend_analysis' in context:
+            trend = context['trend_analysis']
+            bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
+            prompt += f"""
+### 趋势与动量
+| 指标 | 数值 | 判定 |
+|------|------|------|
+| 趋势状态 | {trend.get('trend_status', '未知')} | |
+| 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
+| 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
+| **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
+| 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
+| 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
+
+### MACD 与 RSI
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| MACD DIF | {trend.get('macd_dif', 'N/A')} | |
+| MACD DEA | {trend.get('macd_dea', 'N/A')} | |
+| MACD BAR | {trend.get('macd_bar', 'N/A')} | {trend.get('macd_signal', 'N/A')} |
+| MACD 状态 | {trend.get('macd_status', 'N/A')} | |
+| RSI(6) | {trend.get('rsi_6', 'N/A')} | |
+| RSI(12) | {trend.get('rsi_12', 'N/A')} | |
+| RSI(24) | {trend.get('rsi_24', 'N/A')} | {trend.get('rsi_signal', 'N/A')} |
+| RSI 状态 | {trend.get('rsi_status', 'N/A')} | |
+"""
+
+        # 量价变化
+        if 'yesterday' in context:
+            prompt += f"""
+### 量价变化 vs 昨日
+- 成交量较昨日变化：{context.get('volume_change_ratio', 'N/A')}倍
+- 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
+"""
+
+        prompt += f"""
+---
+
+## ✅ 第一步任务：纯技术面趋势判断
+
+⚠️ 本步骤**只分析价格、均线、量能、MACD/RSI**——不看筹码、不看回测、不看新闻。
+
+输出 JSON：
+```json
+{{
+    "trend_direction": "上升趋势/下降趋势/横盘震荡",
+    "ma_alignment": "多头排列/空头排列/均线缠绕",
+    "ma_values": "MA5=X > MA10=Y > MA20=Z 的完整数值",
+    "bias_ma5_pct": 0.0,
+    "bias_status": "安全(<2%)/警戒(2-5%)/追高风险(>5%)",
+    "momentum": {{
+        "macd_signal": "多头/空头/金叉/死叉/底背离/顶背离",
+        "rsi_value": 50,
+        "rsi_status": "正常/超买/超卖"
+    }},
+    "volume_assessment": "缩量回调/放量突破/缩量下跌/放量下跌/量价背离",
+    "volume_ratio": 0.0,
+    "turnover_rate": 0.0,
+    "trend_strength_100": 0,
+    "technical_risk_signals": ["风险信号"],
+    "preliminary_bias": "偏多/偏空/中性",
+    "key_observations": "2-3个最重要的技术面发现，逗号分隔"
+}}
+```
+"""
+        return prompt
+
+    def _format_step2_prompt(
+        self, context: Dict[str, Any], name: str,
+        step1_result: Dict[str, Any],
+    ) -> str:
+        """Step 2: Structural validation — chip distribution + quant backtest, referencing step 1."""
+        code = context.get('code', 'Unknown')
+        stock_name = context.get('stock_name', name)
+        if not stock_name or stock_name == f'股票{code}':
+            stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
+
+        step1_json = json.dumps(step1_result, ensure_ascii=False, indent=2)
+
+        prompt = f"""# 结构验证分析（第二步）
+
+## 📊 股票基础信息
+| 项目 | 数据 |
+|------|------|
+| 股票代码 | **{code}** |
+| 股票名称 | **{stock_name}** |
+
+## 📋 第一步结果：技术面趋势判断
+
+```json
+{step1_json}
+```
+
+---
+
+## 🏷️ 筹码分布数据
+"""
+        if 'chip' in context:
+            chip = context['chip']
+            profit_ratio = chip.get('profit_ratio', 0)
+            prompt += f"""
+| 指标 | 数值 | 健康标准 |
+|------|------|----------|
+| 数据日期 | {chip.get('date', 'N/A')} | 缓存数据仅作参考 |
+| 数据来源 | {chip.get('source', 'N/A')} | cache: 开头表示使用缓存 |
+| **获利比例** | **{profit_ratio:.1%}** | <10%极重套牢 / 10-70%正常 / >70%获利回吐风险 |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | |
+| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <8%高度集中 <15%集中 |
+| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
+| 筹码状态 | {chip.get('chip_status', '未知')} | |
+"""
+        else:
+            prompt += "\n⚠️ 筹码分布数据未获取。\n"
+
+        prompt += """
+---
+
+## 📈 量化回测数据
+"""
+        config = get_config()
+        if getattr(config, "quant_backtest_prompt_enabled", False):
+            try:
+                from src.services.quant_context_service import (
+                    format_quant_summary_for_prompt,
+                    get_quant_summary_by_code,
+                )
+                quant_summary = get_quant_summary_by_code(
+                    code,
+                    getattr(config, "quant_backtest_summary_path", "reports/stock_pool_backtest_summary.json"),
+                )
+                quant_prompt = format_quant_summary_for_prompt(quant_summary)
+                if quant_prompt:
+                    prompt += quant_prompt
+                else:
+                    prompt += "\n⚠️ 该标的无可用回测数据。\n"
+            except Exception as e:
+                logger.debug("Quant backtest skipped: %s", e)
+                prompt += "\n⚠️ 回测数据获取失败。\n"
+        else:
+            prompt += "\n回测功能未启用。\n"
+
+        prompt += f"""
+---
+
+## ✅ 第二步任务：验证第一趋势判断
+
+你的任务是：
+1. **筹码验证**：获利比例/集中度/成本关系是否支持第一步的趋势判断？如果趋势偏多但获利>70%，必须标注"筹码质疑看多信号"
+2. **回测验证**：历史回测结果是否支持当前判断？夏普/最大回撤/策略收益是确认还是推翻？
+3. **综合调整**：在第一 `preliminary_bias` 基础上，根据筹码和回测调整方向。例如筹码深套+回测高风险 → 即使趋势偏多也应转为中性或偏空
+
+输出 JSON：
+```json
+{{
+    "chip_validation": "确认看多/质疑看多/确认看空/质疑看空/中性",
+    "chip_reasoning": "筹码验证的详细理由（100字以内）",
+    "chip_health": "健康/一般/危险",
+    "chip_profit_level": "极重套牢/深套/正常/获利较高/极度获利",
+    "backtest_validation": "确认/质疑/数据不足",
+    "backtest_reasoning": "回测验证的详细理由（100字以内）",
+    "adjusted_bias": "偏多/偏空/中性",
+    "adjusted_sentiment": 0,
+    "risk_signals_from_validation": ["结构风险信号"],
+    "key_validation_points": "2-3个最重要的验证发现"
+}}
+```
+
+⚠️ 如果回测样本不足，`backtest_validation` 应为 "数据不足"，只在 `backtest_reasoning` 中说明，不得将其解读为策略亏损。
+"""
+        return prompt
+
+    def _format_step3_prompt(
+        self, context: Dict[str, Any], name: str,
+        news_context: Optional[str],
+        step1_result: Dict[str, Any],
+        step2_result: Dict[str, Any],
+    ) -> str:
+        """Step 3: Final synthesis — news + guardrails + step1/2 results → decision dashboard."""
+        code = context.get('code', 'Unknown')
+        stock_name = context.get('stock_name', name)
+        if not stock_name or stock_name == f'股票{code}':
+            stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
+
+        step1_json = json.dumps(step1_result, ensure_ascii=False, indent=2)
+        step2_json = json.dumps(step2_result, ensure_ascii=False, indent=2)
+
+        prompt = f"""# 最终决策仪表盘（第三步）
+
+## 📊 股票基础信息
+| 项目 | 数据 |
+|------|------|
+| 股票代码 | **{code}** |
+| 股票名称 | **{stock_name}** |
+
+## 📋 前两步分析结果
+
+### Step 1：技术面趋势
+```json
+{step1_json}
+```
+
+### Step 2：结构验证（筹码 + 回测）
+```json
+{step2_json}
+```
+
+---
+
+"""
+
+        # Decision guardrails
+        decision_guardrails = self._format_decision_guardrails(self._build_decision_guardrails(context))
+        if decision_guardrails:
+            prompt += f"{decision_guardrails}\n---\n\n"
+
+        # News
+        prompt += "## 📰 舆情情报\n"
+        if news_context:
+            if context.get('is_index_etf'):
+                prompt += f"""
+以下是 **{stock_name}({code})** 近7日新闻，重点提取指数走势、跟踪误差、流动性风险：
+
+```
+{news_context}
+```
+"""
+            else:
+                prompt += f"""
+以下是 **{stock_name}({code})** 近7日新闻，重点提取减持、处罚、业绩预告等风险信号：
+
+```
+{news_context}
+```
+"""
+        else:
+            prompt += "\n未搜索到该股票近期新闻。\n"
+
+        prompt += f"""
+---
+
+## ✅ 第三步任务：输出完整决策仪表盘 JSON
+
+综合 Step1 技术面趋势、Step2 筹码+回测验证、舆情情报，为 **{stock_name}({code})** 生成完整决策仪表盘。
+
+⚠️ **硬约束**：
+- `sentiment_score` = Step2 的 `adjusted_sentiment` 基础上，根据新闻加减分（减持/利空 -10~20，利好 +5~15）
+- `chip_structure.profit_ratio` 必须使用 Step2 的 `chip_profit_level`、`chip_health`
+- `operation_advice` 必须与 Step2 的 `adjusted_bias` 一致，不得矛盾
+- 回测高风险/样本不足时，不得给出"买入"建议
+
+{"" if not context.get('is_index_etf') else "> ⚠️ 指数/ETF 约束：严禁将基金公司诉讼、高管变动纳入 risk_alerts"}
+
+请输出完整的 JSON 格式决策仪表盘。"""
+        return prompt
+
+    def _analyze_step(self, label: str, prompt: str, max_tokens: int = 2048) -> Optional[str]:
+        """Run a single step LLM call, return raw response text."""
+        config = get_config()
+        generation_config = {
+            "temperature": config.gemini_temperature,
+            "max_output_tokens": max_tokens,
+        }
+        logger.info(f"[{label}] Prompt 长度: {len(prompt)} 字符")
+        response_text, model_used, usage = self._call_litellm(prompt, generation_config)
+        logger.info(f"[{label}完成] 模型: {model_used}, tokens: {usage.get('total_tokens', 'N/A')}")
+        return response_text
+
+    def _parse_step_json(self, response_text: str, step_label: str) -> Optional[Dict[str, Any]]:
+        """Parse JSON from a step response. Returns None on failure."""
+        try:
+            cleaned = response_text
+            if '```json' in cleaned:
+                cleaned = cleaned.replace('```json', '').replace('```', '')
+            elif '```' in cleaned:
+                cleaned = cleaned.replace('```', '')
+            json_start = cleaned.find('{')
+            json_end = cleaned.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                return json.loads(cleaned[json_start:json_end])
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[{step_label}] JSON 解析失败 ({e}), raw: {response_text[:300]}")
+        return None
 
     def _build_decision_guardrails(self, context: Dict[str, Any]) -> Dict[str, Any] | None:
         config = get_config()

@@ -217,6 +217,12 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    parser.add_argument(
+        '--force-backtest',
+        action='store_true',
+        help='强制重新运行本地量化回测（忽略缓存新鲜度）'
+    )
+
     # === Personal trades ===
     parser.add_argument(
         '--add-trade',
@@ -381,6 +387,16 @@ def run_full_analysis(
             and not getattr(args, 'no_market_review', False)
             and not config.single_stock_notify
         )
+
+        # === Auto quant backtest before stock analysis ===
+        try:
+            if getattr(config, 'quant_backtest_enabled', False) and getattr(config, 'quant_backtest_auto_run', False):
+                from src.services.strategy_backtest_service import ensure_quant_backtest_summary
+
+                logger.info("检查/运行本地量化回测...")
+                ensure_quant_backtest_summary(force=getattr(args, 'force_backtest', False))
+        except Exception as e:
+            logger.warning("量化回测执行失败（已忽略）: %s", e)
 
         # 创建调度器
         save_context_snapshot = None

@@ -348,7 +348,17 @@ class StockAnalysisPipeline:
 
                 # Chip distribution trace
                 if chip_data:
-                    result.chip_source = getattr(chip_data, 'source', '')
+                    chip_src = getattr(chip_data, 'source', '')
+                    chip_date = getattr(chip_data, 'date', '')
+                    today_str = date.today().strftime('%Y%m%d')
+                    is_cached = (
+                        not chip_date
+                        or chip_date.replace('-', '') < today_str
+                        or 'cache' in str(getattr(chip_data, 'source', '')).lower()
+                    )
+                    if is_cached:
+                        chip_src = f"cache:{chip_src}"
+                    result.chip_source = chip_src
                     result.chip_ok = True
                 else:
                     result.chip_ok = False
@@ -1154,8 +1164,59 @@ class StockAnalysisPipeline:
                 self._send_notifications(results, report_type, skip_push=True)
             else:
                 self._send_notifications(results, report_type)
-        
+
+        # Export chip distribution data to file for quick viewing (runs regardless of notification mode)
+        if results and not dry_run:
+            self._export_chip_distribution_file(results)
+
         return results
+
+    def _export_chip_distribution_file(self, results: List[AnalysisResult]) -> None:
+        """Export chip distribution data for all analyzed stocks to a JSON file."""
+        try:
+            import json
+            from datetime import datetime
+            from pathlib import Path
+
+            chip_list = []
+            for r in results:
+                try:
+                    chip = self.db.get_recent_chip_distribution(r.code, max_age_days=7)
+                except Exception:
+                    chip = None
+                if chip:
+                    chip_list.append({
+                        "code": r.code,
+                        "name": r.name,
+                        "date": getattr(chip, "date", ""),
+                        "source": getattr(chip, "source", ""),
+                        "profit_ratio": round(getattr(chip, "profit_ratio", 0) * 100, 1),
+                        "avg_cost": getattr(chip, "avg_cost", None),
+                        "concentration_90": round(getattr(chip, "concentration_90", 0) * 100, 2),
+                        "concentration_70": round(getattr(chip, "concentration_70", 0) * 100, 2),
+                        "cost_90_low": getattr(chip, "cost_90_low", None),
+                        "cost_90_high": getattr(chip, "cost_90_high", None),
+                    })
+                else:
+                    chip_list.append({
+                        "code": r.code,
+                        "name": r.name,
+                        "date": "",
+                        "source": "unavailable",
+                        "profit_ratio": None,
+                    })
+
+            output_path = Path("reports/chip_distribution_latest.json")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                "generated_at": datetime.now().isoformat(),
+                "stock_count": len(chip_list),
+                "stocks": chip_list,
+            }
+            output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"筹码分布数据已导出: {output_path} ({len(chip_list)} 只)")
+        except Exception as e:
+            logger.warning(f"筹码分布导出失败: {e}")
     
     def _send_notifications(
         self,

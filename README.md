@@ -118,7 +118,7 @@ QUANT_BACKTEST_PROMPT_ENABLED=true python src/inspect_quant_prompt.py
 | `QUANT_BACKTEST_USE_STOCK_LIST` | `true` | 是否使用 `.env` 的 `STOCK_LIST` 作为本地/云端量化股票池 |
 | `QUANT_BACKTEST_STOCK_POOL_PATH` | `stock_pool.txt` | 股票池文件路径 |
 | `QUANT_BACKTEST_STALE_HOURS` | `24` | 摘要超过多少小时视为过期，供自动运行逻辑使用 |
-| `QUANT_BACKTEST_LOOKBACK_YEARS` | `0` | 大于 0 时，本地/云端回测自动用“当前日期往前 N 年”作为区间 |
+| `QUANT_BACKTEST_LOOKBACK_MONTHS` | `0` | 大于 0 时，本地/云端回测自动用“当前日期往前 N 个月”作为区间 |
 | `QUANT_BACKTEST_START_DATE` | `20200101` | 自动运行本地量化回测时使用的开始日期 |
 | `QUANT_BACKTEST_END_DATE` | `20240501` | 自动运行本地量化回测时使用的结束日期 |
 | `QUANT_BACKTEST_FAST_WINDOW` | `5` | 自动运行本地量化回测时使用的快线 MA 窗口 |
@@ -141,6 +141,7 @@ QUANT_BACKTEST_PROMPT_ENABLED=true python src/inspect_quant_prompt.py
 | `DECISION_REPORT_OUTPUT_PATH` | `reports/daily_decision_report.md` | 决策报告输出路径 |
 
 开启后，prompt 会要求模型在最终建议中考虑收益、基准收益、最大回撤、夏普、交易次数、风险等级和样本不足等约束。
+报告会区分两类不可用状态：摘要未命中本次股票时提示重新生成本次股票池摘要；摘要已命中但样本不足或取数失败时提示检查 `QUANT_BACKTEST_DATA_SOURCE`、日期区间和股票代码格式。样本不足不会被当作策略亏损或策略失效。
 `QUANT_BACKTEST_ENABLED=true` 时，主流程会在个股分析前检查本地量化摘要；若摘要缺失或过期且 `QUANT_BACKTEST_AUTO_RUN=true`，会自动运行股票池回测生成摘要。云端回测、对比检查、决策风控和行动清单开关当前作为后续模块入口，默认关闭，不影响原有 `.env` 一键运行体验。
 如果希望使用聚宽行情做本地 vectorbt 回测，可安装 `jqdatasdk` 并设置 `QUANT_BACKTEST_DATA_SOURCE=joinquant`、`JOINQUANT_USERNAME`、`JOINQUANT_PASSWORD`；该模式只替换本地回测行情源，不自动调用聚宽云端回测任务。
 开启 `DECISION_RULE_ENABLED=true` 后，系统会基于 `config/decision_rules.yaml` 对样本不足、跑输基准、高回撤、乖离率过高和数据缺失等场景生成硬约束，并在 LLM 输出越界时自动降级为更保守建议。
@@ -295,8 +296,9 @@ reports/quant_backtest_report_preview.md
 | `DUCKDUCKGO_ENABLED` | 设为 `true` 启用 DuckDuckGo 免 Key 兜底（推荐作为最后一道防线） | 可选 |
 | `NEWS_SEARCH_SOURCE_PRIORITY` | 搜索源优先级，逗号分隔。默认 `bocha,tavily,brave,serpapi,minimax,bing,googlecse,searxng,duckduckgo` | 可选 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
-| `ENABLE_CHIP_DISTRIBUTION` | 筹码分布开关；开启后优先使用今日缓存，再尝试 Tushare/AkShare 远程数据 | 可选 |
+| `ENABLE_CHIP_DISTRIBUTION` | 筹码分布开关；开启后优先使用今日缓存，再按 `CHIP_DISTRIBUTION_SOURCE_PRIORITY` 尝试数据源 | 可选 |
 | `CHIP_DISTRIBUTION_CACHE_TTL_DAYS` | 筹码分布最近缓存兜底天数，默认 7 | 可选 |
+| `CHIP_DISTRIBUTION_SOURCE_PRIORITY` | 筹码分布数据源优先级，默认 `tushare,akshare,instock`；`runStock.sh` 会临时使用 `instock,akshare,tushare` | 可选 |
 | `PREFETCH_REALTIME_QUOTES` | 实时行情预取开关：设为 `false` 可禁用全市场预取（默认 `true`） | 可选 |
 | `WECHAT_MSG_TYPE` | 企微消息类型，默认 markdown，支持配置 text 类型，发送纯 markdown 文本 | 可选 |
 | `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），默认 3，避免使用过时信息 | 可选 |

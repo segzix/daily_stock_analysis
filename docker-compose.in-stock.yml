@@ -1,0 +1,35 @@
+services:
+  instock-db:
+    image: mariadb:10.11
+    container_name: InStockDbService
+    environment:
+      MYSQL_ROOT_PASSWORD: stock2024
+      MYSQL_DATABASE: instockdb
+    volumes:
+      - ./docker/instock/mariadb:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  instock:
+    image: mayanghua/instock:latest
+    container_name: InStock
+    ports:
+      - "9988:9988"
+    environment:
+      db_host: instock-db
+      db_user: root
+      db_password: stock2024
+      db_database: instockdb
+      db_port: 3306
+    volumes:
+      - ./docker/instock/proxy.txt:/data/InStock/instock/config/proxy.txt:ro
+      - ./docker/instock/eastmoney_cookie.txt:/data/InStock/instock/config/eastmoney_cookie.txt:ro
+    depends_on:
+      instock-db:
+        condition: service_healthy
+    restart: unless-stopped

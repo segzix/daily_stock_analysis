@@ -47,6 +47,7 @@ FETCHER_SOURCE_ALIASES = {
     "pytdx": "PytdxFetcher",
     "baostock": "BaostockFetcher",
     "yfinance": "YfinanceFetcher",
+    "instock": "InstockFetcher",
 }
 
 
@@ -474,6 +475,7 @@ class DataFetcherManager:
         from .pytdx_fetcher import PytdxFetcher
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
+        from .instock_fetcher import InstockFetcher
         from src.config import get_config
 
         config = get_config()
@@ -485,6 +487,7 @@ class DataFetcherManager:
         pytdx = PytdxFetcher()      # 通达信数据源（可配 PYTDX_HOST/PYTDX_PORT）
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
+        instock = InstockFetcher()  # InStock CYQ chip distribution
 
         # 初始化数据源列表
         self._fetchers = [
@@ -494,6 +497,7 @@ class DataFetcherManager:
             pytdx,
             baostock,
             yfinance,
+            instock,
         ]
 
         # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
@@ -983,6 +987,7 @@ class DataFetcherManager:
             "AkshareFetcher": "akshare_chip",
             "TushareFetcher": "tushare_chip",
             "EfinanceFetcher": "efinance_chip",
+            "InstockFetcher": "instock_chip",
         }
         chip_sources = [
             (fetcher.name, source_key_by_fetcher.get(fetcher.name, fetcher.name.lower()))
@@ -1093,6 +1098,9 @@ class DataFetcherManager:
             fetcher_name = FETCHER_SOURCE_ALIASES.get(source)
             fetcher = next((item for item in self._fetchers if item.name == fetcher_name), None)
             if fetcher and hasattr(fetcher, 'get_stock_name'):
+                if hasattr(fetcher, 'is_available') and not fetcher.is_available():
+                    logger.debug(f"[股票名称] {fetcher.name} 暂不可用(熔断/限流)，跳过")
+                    continue
                 try:
                     name = fetcher.get_stock_name(stock_code)
                     if name:

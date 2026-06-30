@@ -239,6 +239,97 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         self.assertIn("AI历史回测", out)
         self.assertIn("量化策略回测", out)
 
+    def test_backtest_section_uses_existing_average_return_fields(self):
+        service = NotificationService()
+        lines = []
+
+        service._append_backtest_section(
+            lines,
+            {
+                "analysis_backtests": {
+                    "status": "effective",
+                    "conclusion": "AI 历史回测生效",
+                    "overall": {
+                        "completed_count": 2,
+                        "win_rate_pct": 50,
+                        "direction_accuracy_pct": 50,
+                        "avg_stock_return_pct": 1.23,
+                        "avg_simulated_return_pct": 2.34,
+                    },
+                }
+            },
+        )
+
+        out = "\n".join(lines)
+        self.assertIn("| 2 | 50.00% | 50.00% | 2.34% |", out)
+        self.assertNotIn("| 2 | 50.00% | 50.00% | N/A |", out)
+
+    def test_quant_backtest_section_renders_unusable_data_as_data_issue_only(self):
+        service = NotificationService()
+        lines = []
+        conclusion = (
+            "量化回测已命中本次报告股票，"
+            "但行情数据缺失或样本不足，未形成可用验证结论"
+        )
+        recommended_action = (
+            "请检查 QUANT_BACKTEST_DATA_SOURCE、回测日期区间和股票代码格式，"
+            "修复取数后重新生成摘要。"
+        )
+
+        service._append_backtest_section(
+            lines,
+            {
+                "quant_backtests": {
+                    "status": "no_valid_data",
+                    "effective": False,
+                    "conclusion": conclusion,
+                    "recommended_action": recommended_action,
+                    "strategy": "MA Crossover (5, 20)",
+                    "start_date": "20251230",
+                    "end_date": "20260630",
+                    "data_source": "akshare",
+                    "success": 0,
+                    "failed": 1,
+                    "insufficient": 1,
+                    "items": [
+                        {
+                            "symbol": "600118.SH",
+                            "success": False,
+                            "status": "insufficient_data",
+                            "metrics": {},
+                            "data": {"sample_count": 0},
+                            "assessment": {"risk_level": "N/A", "is_effective": False},
+                        }
+                    ],
+                    "top_by_sharpe": [
+                        {
+                            "symbol": "600118.SH",
+                            "success": False,
+                            "status": "insufficient_data",
+                            "metrics": {},
+                            "data": {"sample_count": 0},
+                            "assessment": {"risk_level": "N/A", "is_effective": False},
+                        }
+                    ],
+                    "data_issue_items": [
+                        {
+                            "symbol": "600118.SH",
+                            "status": "insufficient_data",
+                            "sample_count": 0,
+                            "required_sample_count": 20,
+                            "conclusion": "数据不足，无法回测",
+                        }
+                    ],
+                }
+            },
+        )
+
+        out = "\n".join(lines)
+        self.assertIn("⚠️ 量化回测已命中本次报告股票", out)
+        self.assertIn("样本 0/20", out)
+        self.assertNotIn("| 600118.SH |", out)
+        self.assertNotIn("0.00%", out)
+
     @mock.patch("src.notification.get_config")
     def test_single_stock_pipeline_trace_includes_backtest_effectiveness(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config(backtest_enabled=False, quant_backtest_enabled=False)
@@ -256,6 +347,10 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         self.assertIn("管线追踪", out)
         self.assertIn("回测验证", out)
+        self.assertIn(">     回测验证:", out)
+        self.assertIn(">         AI历史:", out)
+        self.assertIn(">         量化策略:", out)
+        self.assertNotIn(">     回测验证: AI历史:", out)
         self.assertIn("AI 历史回测未启用", out)
         self.assertIn("量化回测未启用", out)
 

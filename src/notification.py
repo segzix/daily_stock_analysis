@@ -661,7 +661,8 @@ class NotificationService(
                 ])
 
                 self._append_market_snapshot(report_lines, result)
-                
+                self._append_step_analysis(report_lines, result)
+
                 # 核心看点
                 if hasattr(result, 'key_points') and result.key_points:
                     report_lines.extend([
@@ -820,6 +821,81 @@ class NotificationService(
             return str(value)
 
     @staticmethod
+    def _fmt_signed(value: Any) -> str:
+        """Format a signed numeric value for compact report output."""
+        if value is None or value == "":
+            return "N/A"
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _fmt_int(value: Any) -> str:
+        """Format an integer value for compact report output."""
+        if value is None or value == "":
+            return "N/A"
+        try:
+            return str(int(float(value)))
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _analysis_backtest_avg_return_pct(overall: Dict[str, Any]) -> Any:
+        simulated_return = overall.get("avg_simulated_return_pct")
+        if simulated_return is not None and simulated_return != "":
+            return simulated_return
+        return overall.get("avg_stock_return_pct")
+
+    @staticmethod
+    def _get_raw_chip_for_report(result: "AnalysisResult") -> Optional[Dict[str, Any]]:
+        """Get raw chip distribution data for display in reports.
+        
+        Prefers DB cache; falls back to live fetch if DB has no data.
+        """
+        try:
+            from src.storage import get_db
+
+            # Try DB cache first
+            try:
+                chip = get_db().get_recent_chip_distribution(result.code, max_age_days=7)
+                if chip:
+                    return NotificationService._build_chip_dict(chip, result)
+            except Exception as e:
+                logger.debug(f"筹码DB查询失败 {result.code}: {e}")
+
+            # Fallback: live fetch
+            logger.info(f"报告筹码DB无数据 {result.code}，尝试实时获取...")
+            try:
+                from data_provider.base import DataFetcherManager
+                mgr = DataFetcherManager()
+                chip = mgr.get_chip_distribution(result.code)
+                if chip:
+                    return NotificationService._build_chip_dict(chip, result)
+            except Exception as e:
+                logger.debug(f"筹码实时获取失败 {result.code}: {e}")
+
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _build_chip_dict(chip, result: "AnalysisResult") -> Dict[str, Any]:
+        return {
+            "source": getattr(chip, "source", "N/A"),
+            "date": getattr(chip, "date", "N/A"),
+            "profit_ratio_pct": round(getattr(chip, "profit_ratio", 0) * 100, 1),
+            "avg_cost": getattr(chip, "avg_cost", None),
+            "concentration_90_pct": round(getattr(chip, "concentration_90", 0) * 100, 2),
+            "concentration_70_pct": round(getattr(chip, "concentration_70", 0) * 100, 2),
+            "cost_90_low": getattr(chip, "cost_90_low", None),
+            "cost_90_high": getattr(chip, "cost_90_high", None),
+            "cost_70_low": getattr(chip, "cost_70_low", None),
+            "cost_70_high": getattr(chip, "cost_70_high", None),
+            "chip_status": chip.get_chip_status(getattr(result, "current_price", 0) or 0),
+        }
+
+    @staticmethod
     def _backtest_status_icon(backtest_context: Optional[Dict[str, Any]]) -> str:
         """Return a compact status icon for a backtest context block."""
         if not backtest_context:
@@ -829,7 +905,7 @@ class NotificationService(
         status = str(backtest_context.get("status") or "").lower()
         if status in {"error", "failed"}:
             return "❌"
-        if status in {"disabled", "missing", "empty", "no_match", "ineffective"}:
+        if status in {"disabled", "missing", "empty", "no_match", "no_valid_data", "ineffective"}:
             return "⚠️"
         return "⚪"
 
@@ -872,6 +948,89 @@ class NotificationService(
             trace += f" → {verdict}"
         return trace
 
+    def _append_step_analysis(self, lines: List[str], result: "AnalysisResult") -> None:
+        """Render the 3-step analysis process (step1 technical, step2 validation)."""
+        step1 = getattr(result, 'step1_technical', None)
+        step2 = getattr(result, 'step2_validation', None)
+        if not step1 and not step2:
+            return
+
+        lines.extend(["### 🔍 分步分析过程", ""])
+
+        if step1:
+            trend_dir = step1.get('trend_direction', 'N/A')
+            bias = step1.get('preliminary_bias', 'N/A')
+            bias_emoji = '📈' if bias == '偏多' else ('📉' if bias == '偏空' else '📊')
+            ma = step1.get('ma_alignment', 'N/A')
+            ma_vals = step1.get('ma_values', '')
+            bias_pct = step1.get('bias_ma5_pct', 'N/A')
+            bias_st = step1.get('bias_status', 'N/A')
+            momentum = step1.get('momentum', {})
+            macd_sig = momentum.get('macd_signal', 'N/A') if isinstance(momentum, dict) else 'N/A'
+            rsi_val = momentum.get('rsi_value', 'N/A') if isinstance(momentum, dict) else 'N/A'
+            rsi_st = momentum.get('rsi_status', 'N/A') if isinstance(momentum, dict) else 'N/A'
+            vol_asm = step1.get('volume_assessment', 'N/A')
+            trend_str = step1.get('trend_strength_100', 'N/A')
+            risks = step1.get('technical_risk_signals', [])
+            obsv = step1.get('key_observations', '')
+
+            lines.extend([
+                f"**Step 1 · 技术面趋势** {bias_emoji} {bias}",
+                "",
+                "| 指标 | 数值 |",
+                "|------|------|",
+                f"| 趋势方向 | {trend_dir} |",
+                f"| 均线排列 | {ma} |",
+            ])
+            if ma_vals:
+                lines.append(f"| 均线数值 | {ma_vals} |")
+            lines.extend([
+                f"| 乖离率(MA5) | {bias_pct}% ({bias_st}) |",
+                f"| MACD | {macd_sig} |",
+                f"| RSI | {rsi_val} ({rsi_st}) |",
+                f"| 量能判断 | {vol_asm} |",
+                f"| 趋势强度 | {trend_str}/100 |",
+            ])
+            if obsv:
+                lines.append(f"| 核心发现 | {obsv} |")
+            if risks:
+                risk_str = '、'.join(str(r) for r in risks[:3])
+                lines.append(f"| 风险信号 | ⚠️ {risk_str} |")
+            lines.append("")
+
+        if step2:
+            chip_val = step2.get('chip_validation', 'N/A')
+            chip_reason = step2.get('chip_reasoning', '')
+            chip_health = step2.get('chip_health', 'N/A')
+            chip_level = step2.get('chip_profit_level', 'N/A')
+            bt_val = step2.get('backtest_validation', 'N/A')
+            bt_reason = step2.get('backtest_reasoning', '')
+            adj_bias = step2.get('adjusted_bias', 'N/A')
+            adj_score = step2.get('adjusted_sentiment', 'N/A')
+            s2_risks = step2.get('risk_signals_from_validation', [])
+            s2_points = step2.get('key_validation_points', '')
+
+            chip_emoji_map = {'确认看多': '✅', '质疑看多': '⚠️', '确认看空': '❌', '质疑看空': '⚠️', '中性': '➖'}
+            chip_emoji = chip_emoji_map.get(chip_val, '')
+            bt_emoji_map = {'确认': '✅', '质疑': '⚠️', '数据不足': '⚪'}
+            bt_emoji = bt_emoji_map.get(bt_val, '')
+
+            lines.extend([
+                f"**Step 2 · 结构验证** → 调整方向: {adj_bias} (评分 {adj_score})",
+                "",
+                "| 验证维度 | 结论 | 理由 |",
+                "|----------|------|------|",
+                f"| 筹码分布 | {chip_emoji} {chip_val} | {chip_reason or f'获利{chip_level}，{chip_health}'} |",
+                f"| 量化回测 | {bt_emoji} {bt_val} | {bt_reason or '—'} |",
+            ])
+            if s2_points:
+                lines.append(f"| 关键发现 | | {s2_points} |")
+            if s2_risks:
+                lines.append(f"| 结构风险 | | ⚠️ {'、'.join(str(r) for r in s2_risks[:3])} |")
+            lines.append("")
+
+        lines.append("")
+
     def _append_backtest_section(
         self,
         lines: List[str],
@@ -905,47 +1064,88 @@ class NotificationService(
         heading = "#" * heading_level
         lines.extend([f"{heading} 📈 回测验证", ""])
         if analysis:
-            lines.append(f"- **AI历史回测**：{self._backtest_status_icon(analysis)} {analysis.get('conclusion', 'N/A')}")
+            lines.append(
+                f"- **AI历史回测**：{self._backtest_status_icon(analysis)} "
+                f"{analysis.get('conclusion', 'N/A')}"
+            )
             overall = analysis.get("overall") or {}
             if overall:
                 lines.extend([
-                    "",
                     "| 样本 | 胜率 | 方向准确率 | 平均收益 |",
                     "|------|------|------------|----------|",
                     (
                         f"| {overall.get('completed_count', 'N/A')} | "
                         f"{self._fmt_pct(overall.get('win_rate_pct'))} | "
                         f"{self._fmt_pct(overall.get('direction_accuracy_pct'))} | "
-                        f"{self._fmt_pct(overall.get('avg_return_pct'))} |"
+                        f"{self._fmt_pct(self._analysis_backtest_avg_return_pct(overall))} |"
                     ),
                 ])
             lines.append("")
 
         if quant:
-            lines.append(f"- **量化策略回测**：{self._backtest_status_icon(quant)} {quant.get('conclusion', 'N/A')}")
+            lines.append(
+                f"- **量化策略回测**：{self._backtest_status_icon(quant)} "
+                f"{quant.get('conclusion', 'N/A')}"
+            )
+            if quant.get("recommended_action"):
+                lines.append(f"- 建议处理：{quant.get('recommended_action')}")
+            if quant.get("unmatched_codes"):
+                lines.append(
+                    f"- 未命中股票：{', '.join(quant.get('unmatched_codes', []))} | "
+                    f"摘要覆盖：{', '.join((quant.get('available_symbols') or [])[:10]) or 'N/A'}"
+                )
             if quant.get("items"):
                 lines.append(
                     f"- 策略：{quant.get('strategy', 'N/A')} | "
                     f"区间：{quant.get('start_date', 'N/A')} 至 {quant.get('end_date', 'N/A')} | "
-                    f"成功：{quant.get('success', 0)} | 失败：{quant.get('failed', 0)}"
+                    f"数据源：{quant.get('data_source', 'N/A')} | "
+                    f"成功：{quant.get('success', 0)} | 失败：{quant.get('failed', 0)} | "
+                    f"样本不足：{quant.get('insufficient', 0)}"
                 )
-                lines.extend([
-                    "",
-                    "| 股票 | 收益 | 基准 | 最大回撤 | 夏普 | 胜率 | 风险 |",
-                    "|------|------|------|----------|------|------|------|",
-                ])
-                for bt in (quant.get("top_by_sharpe") or quant.get("items") or [])[:5]:
-                    metrics = bt.get("metrics") or {}
-                    assessment = bt.get("assessment") or {}
+                assumptions = quant.get("assumptions") or {}
+                if assumptions.get("fees") is not None or assumptions.get("slippage") is not None:
                     lines.append(
-                        f"| {bt.get('symbol', bt.get('code', 'N/A'))} | "
-                        f"{self._fmt_pct(metrics.get('total_return_pct'))} | "
-                        f"{self._fmt_pct(metrics.get('benchmark_return_pct'))} | "
-                        f"{self._fmt_pct(metrics.get('max_drawdown_pct'))} | "
-                        f"{metrics.get('sharpe_ratio', 'N/A')} | "
-                        f"{self._fmt_pct(metrics.get('win_rate_pct'))} | "
-                        f"{assessment.get('risk_level', 'N/A')} |"
+                        f"- 手续费：{assumptions.get('fees', 'N/A')} | "
+                        f"滑点：{assumptions.get('slippage', 'N/A')}"
                     )
+                metric_items = [
+                    bt for bt in (quant.get("top_by_sharpe") or quant.get("items") or []) if bt.get("success")
+                ]
+                if metric_items:
+                    lines.extend([
+                        (
+                            "| 股票 | 策略收益 | 基准收益 | 超额 | 最大回撤 | 夏普 | "
+                            "卡尔玛 | 盈亏比 | 胜率 | 交易 | 风险 |"
+                        ),
+                        "|---|---|---|---|---|---|---|---|---|---|---|",
+                    ])
+                    for bt in metric_items[:5]:
+                        metrics = bt.get("metrics") or {}
+                        assessment = bt.get("assessment") or {}
+                        lines.append(
+                            f"| {bt.get('symbol', bt.get('code', 'N/A'))} | "
+                            f"{self._fmt_pct(metrics.get('total_return_pct'))} | "
+                            f"{self._fmt_pct(metrics.get('benchmark_return_pct'))} | "
+                            f"{self._fmt_pct(metrics.get('excess_return_pct'))} | "
+                            f"{self._fmt_pct(metrics.get('max_drawdown_pct'))} | "
+                            f"{self._fmt_signed(metrics.get('sharpe_ratio'))} | "
+                            f"{self._fmt_signed(metrics.get('calmar_ratio'))} | "
+                            f"{self._fmt_signed(metrics.get('profit_factor'))} | "
+                            f"{self._fmt_pct(metrics.get('win_rate_pct'))} | "
+                            f"{self._fmt_int(metrics.get('trade_count'))} | "
+                            f"{assessment.get('risk_level', 'N/A')} |"
+                        )
+                if quant.get("data_issue_items"):
+                    lines.append("")
+                    lines.append("**数据问题**：")
+                    for issue in (quant.get("data_issue_items") or [])[:5]:
+                        sample_count = issue.get("sample_count", "N/A")
+                        required_count = issue.get("required_sample_count") or "N/A"
+                        lines.append(
+                            f"- {issue.get('symbol', 'N/A')}：{issue.get('status', 'failed')}，"
+                            f"样本 {sample_count}/{required_count}，"
+                            f"{issue.get('conclusion', '回测数据不可用')}"
+                        )
                 if quant.get("high_risk_items"):
                     high_risk = ", ".join(
                         item.get("symbol", item.get("code", "N/A")) for item in quant.get("high_risk_items", [])
@@ -953,7 +1153,7 @@ class NotificationService(
                     lines.extend(["", f"**高风险提示**：{high_risk}"])
             lines.append("")
 
-        lines.extend(["---", ""])
+            lines.append("")
 
     def _get_signal_level(self, result: AnalysisResult) -> tuple:
         """
@@ -1145,7 +1345,8 @@ class NotificationService(
                     ])
 
                 self._append_market_snapshot(report_lines, result)
-                
+                self._append_step_analysis(report_lines, result)
+
                 # ========== 数据透视 ==========
                 data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
                 if data_persp:
@@ -1194,6 +1395,21 @@ class NotificationService(
                         chip_emoji = "✅" if chip_health == "健康" else ("⚠️" if chip_health == "一般" else "🚨")
                         report_lines.extend([
                             f"**筹码**: 获利比例 {chip_data.get('profit_ratio', 'N/A')} | 平均成本 {chip_data.get('avg_cost', 'N/A')} | 集中度 {chip_data.get('concentration', 'N/A')} {chip_emoji}{chip_health}",
+                            "",
+                        ])
+                    # 追加来自数据源的原始筹码分布（不依赖 LLM）
+                    raw_chip = self._get_raw_chip_for_report(result)
+                    if raw_chip:
+                        report_lines.extend([
+                            "| 筹码指标 | 数值 | 说明 |",
+                            "|----------|------|------|",
+                            f"| 数据来源 | {raw_chip.get('source', 'N/A')} | {raw_chip.get('date', 'N/A')} |",
+                            f"| 获利比例 | {raw_chip.get('profit_ratio_pct', 'N/A')}% | {'>70%警惕获利回吐' if raw_chip.get('profit_ratio_pct', 0) > 70 else '<10%极重套牢盘' if raw_chip.get('profit_ratio_pct', 0) < 10 else '10-70%正常区间'} |",
+                            f"| 平均成本 | {raw_chip.get('avg_cost', 'N/A')} | 现价对比参考 |",
+                            f"| 90%集中度 | {raw_chip.get('concentration_90_pct', 'N/A')}% | <8%高度集中 <15%集中 |",
+                            f"| 70%集中度 | {raw_chip.get('concentration_70_pct', 'N/A')}% | |",
+                            f"| 90%成本区间 | [{raw_chip.get('cost_90_low', 'N/A')}, {raw_chip.get('cost_90_high', 'N/A')}] | 90%持仓成本范围 |",
+                            f"| 筹码状态 | {raw_chip.get('chip_status', 'N/A')} | |",
                             "",
                         ])
                 
@@ -1610,7 +1826,8 @@ class NotificationService(
         self._append_pipeline_trace(lines, result, backtest_context)
 
         self._append_market_snapshot(lines, result)
-        
+        self._append_step_analysis(lines, result)
+
         # 核心决策（一句话）
         one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
         if one_sentence:
@@ -1678,6 +1895,24 @@ class NotificationService(
             lines.append("")
 
         self._append_backtest_section(lines, backtest_context, heading_level=3)
+
+        # 筹码分布（来自数据源，不依赖 LLM）
+        raw_chip = self._get_raw_chip_for_report(result)
+        if raw_chip:
+            lines.extend([
+                "### 🏷️ 筹码分布",
+                "",
+                "| 指标 | 数值 |",
+                "|------|------|",
+                f"| 数据来源 | {raw_chip.get('source', 'N/A')} ({raw_chip.get('date', 'N/A')}) |",
+                f"| 获利比例 | {raw_chip.get('profit_ratio_pct', 'N/A')}% |",
+                f"| 平均成本 | {raw_chip.get('avg_cost', 'N/A')} |",
+                f"| 90%集中度 | {raw_chip.get('concentration_90_pct', 'N/A')}% |",
+                f"| 70%集中度 | {raw_chip.get('concentration_70_pct', 'N/A')}% |",
+                f"| 90%成本区间 | {raw_chip.get('cost_90_low', 'N/A')} ~ {raw_chip.get('cost_90_high', 'N/A')} |",
+                f"| 筹码状态 | {raw_chip.get('chip_status', 'N/A')} |",
+                "",
+            ])
         
         # 狙击点位
         sniper = battle.get('sniper_points', {}) if battle else {}
@@ -1750,7 +1985,13 @@ class NotificationService(
                 status = "❌"
             else:
                 status = "⚠️"
-            trace_parts.append(f"筹码分布: {status} {chip_ok}/{chip_total}")
+            chip_sources = sorted({
+                getattr(r, "chip_source", "")
+                for r in results
+                if getattr(r, "chip_ok", False) and getattr(r, "chip_source", "")
+            })
+            chip_source_str = "/".join(chip_sources) if chip_sources else "N/A"
+            trace_parts.append(f"筹码分布: {status} {chip_ok}/{chip_total} ({chip_source_str})")
         elif any(getattr(r, "chip_ok", True) is False for r in results):
             trace_parts.append("筹码分布: ❌ 无可用数据源")
 
@@ -1779,8 +2020,16 @@ class NotificationService(
             lines.insert(2, "> 🔍 管线追踪")
             idx = 3
             for part in trace_parts:
-                lines.insert(idx, f">     {part}")
-                idx += 1
+                if part.startswith("回测验证:"):
+                    label, details = part.split(": ", 1)
+                    lines.insert(idx, f">     {label}:")
+                    idx += 1
+                    for sub in details.split("；"):
+                        lines.insert(idx, f">         {sub}")
+                        idx += 1
+                else:
+                    lines.insert(idx, f">     {part}")
+                    idx += 1
             lines.insert(idx, ">")
 
     def _append_pipeline_trace(
@@ -1847,6 +2096,13 @@ class NotificationService(
                     lines.insert(idx, f">     {label}:")
                     idx += 1
                     for sub in details.split(" · "):
+                        lines.insert(idx, f">         {sub}")
+                        idx += 1
+                elif part.startswith("回测验证:"):
+                    label, details = part.split(": ", 1)
+                    lines.insert(idx, f">     {label}:")
+                    idx += 1
+                    for sub in details.split("；"):
                         lines.insert(idx, f">         {sub}")
                         idx += 1
                 else:

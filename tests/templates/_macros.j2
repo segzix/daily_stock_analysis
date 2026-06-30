@@ -33,9 +33,11 @@
 {% if analysis_backtests or quant_backtests %}
 {% if compact %}
 **📈 回测验证**
+
 {% if analysis_backtests %}
 AI历史: {{ backtest_icon(analysis_backtests) }} {{ analysis_backtests.conclusion }}
 {% endif %}
+
 {% if quant_backtests %}
 量化策略: {{ backtest_icon(quant_backtests) }} {{ quant_backtests.conclusion }}
 {% endif %}
@@ -44,32 +46,54 @@ AI历史: {{ backtest_icon(analysis_backtests) }} {{ analysis_backtests.conclusi
 
 {% if analysis_backtests %}
 - **AI历史回测**：{{ backtest_icon(analysis_backtests) }} {{ analysis_backtests.conclusion }}
-{% set overall = analysis_backtests.get('overall') or {} %}
-{% if overall %}
-
+{%- set overall = analysis_backtests.get('overall') or {} -%}
+{%- if overall -%}
 | 样本 | 胜率 | 方向准确率 | 平均收益 |
 |------|------|------------|----------|
 | {{ overall.get('completed_count', 'N/A') }} | {{ '%.2f'|format(overall.get('win_rate_pct') or 0) }}% | {{ '%.2f'|format(overall.get('direction_accuracy_pct') or 0) }}% | {{ '%.2f'|format(overall.get('avg_return_pct') or 0) }}% |
-{% endif %}
-{% endif %}
-
-{% if quant_backtests %}
+{%- endif -%}
+{%- endif %}
+{%- if quant_backtests -%}
 - **量化策略回测**：{{ backtest_icon(quant_backtests) }} {{ quant_backtests.conclusion }}
-{% if quant_backtests.items %}
-- 策略：{{ quant_backtests.strategy }} | 区间：{{ quant_backtests.start_date }} 至 {{ quant_backtests.end_date }} | 成功：{{ quant_backtests.success }} | 失败：{{ quant_backtests.failed }}
-
-| 股票 | 收益 | 基准 | 最大回撤 | 夏普 | 胜率 | 风险 |
-|------|------|------|----------|------|------|------|
-{% for bt in quant_backtests.top_by_sharpe[:5] %}
-| {{ bt.symbol }} | {{ '%.2f'|format(bt.metrics.total_return_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.benchmark_return_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.max_drawdown_pct or 0) }}% | {{ '%.2f'|format(bt.metrics.sharpe_ratio or 0) }} | {{ '%.2f'|format(bt.metrics.win_rate_pct or 0) }}% | {{ bt.assessment.risk_level }} |
-{% endfor %}
-{% if quant_backtests.high_risk_items %}
+{%- if quant_backtests.recommended_action -%}
+- 建议处理：{{ quant_backtests.recommended_action }}
+{%- endif -%}
+{%- if quant_backtests.unmatched_codes -%}
+- 未命中股票：{{ quant_backtests.unmatched_codes|join(', ') }} | 摘要覆盖：{{ (quant_backtests.available_symbols or [])[:10]|join(', ') or 'N/A' }}
+{%- endif -%}
+{%- if quant_backtests.items -%}
+- 策略：{{ quant_backtests.strategy }} | 区间：{{ quant_backtests.start_date }} 至 {{ quant_backtests.end_date }} | 数据源：{{ quant_backtests.data_source }} | 基准：{{ quant_backtests.benchmark_name }} | 成功：{{ quant_backtests.success }} | 失败：{{ quant_backtests.failed }} | 样本不足：{{ quant_backtests.insufficient or 0 }}
+{%- if quant_backtests.strategy_rule -%}
+- 规则：{{ quant_backtests.strategy_rule }}
+{%- endif %}
+{%- set metric_items = quant_backtests.top_by_sharpe|selectattr('success')|list -%}
+{%- if metric_items -%}
+**有效回测样本**：
+{% for bt in metric_items[:5] %}
+{%- if bt.data.sample_count is not none -%}
+{%- set sample_count = bt.data.sample_count -%}
+{%- else -%}
+{%- set sample_count = bt.metrics.sample_count or 'N/A' -%}
+{%- endif -%}
+- {{ bt.symbol }}：样本 {{ sample_count }}，风险 {{ bt.assessment.risk_level }}
+- 收益：{{ '%.2f'|format(bt.metrics.total_return_pct or 0) }}%
+{%- endfor -%}
+{%- endif -%}
+{%- if quant_backtests.high_risk_items -%}
 
 **高风险提示**：{{ quant_backtests.high_risk_items|map(attribute='symbol')|join(', ') }}
-{% endif %}
-{% endif %}
-{% endif %}
+{%- endif -%}
+{%- if quant_backtests.data_issue_items -%}
 
-{% endif %}
-{% endif %}
+**数据问题**：
+{% for issue in quant_backtests.data_issue_items[:5] %}
+- {{ issue.symbol }}：{{ issue.status }}
+- 样本 {{ issue.sample_count }}/{{ issue.required_sample_count or 'N/A' }}，{{ issue.conclusion }}
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+
+{%- endif -%}
+{%- endif -%}
 {% endmacro %}

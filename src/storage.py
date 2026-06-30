@@ -1195,7 +1195,8 @@ class DatabaseManager:
                     )
                 )
                 .order_by(desc(ChipDistributionCache.trade_date), desc(ChipDistributionCache.created_at))
-            ).scalar_one_or_none()
+                .limit(1)
+            ).scalars().first()
 
             if cached is None:
                 return None

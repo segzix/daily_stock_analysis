@@ -41,6 +41,9 @@ class ConfigIssue:
 
 
 def _project_env_path() -> Path:
+    env_file = os.getenv("ENV_FILE")
+    if env_file:
+        return Path(env_file)
     return Path(__file__).parent.parent / '.env'
 
 
@@ -96,8 +99,16 @@ def setup_env(override: bool = True):
         if key and value is not None
     }
 
+    # Purge system-level proxy vars so only .env settings take effect
+    _proxy_keys = {'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'}
+    for _k in list(os.environ.keys()):
+        if _k.lower() in _proxy_keys:
+            os.environ.pop(_k, None)
+
     for key in _known_config_env_keys(env_path):
         if key not in env_values:
+            if key.lower() in _proxy_keys:
+                continue
             os.environ.pop(key, None)
             os.environ.pop(key.lower(), None)
 
@@ -316,7 +327,7 @@ class Config:
     quant_backtest_use_stock_list: bool = True
     quant_backtest_stock_pool_path: str = "stock_pool.txt"
     quant_backtest_stale_hours: int = 24
-    quant_backtest_lookback_years: int = 0
+    quant_backtest_lookback_months: int = 0
     quant_backtest_start_date: str = "20200101"
     quant_backtest_end_date: str = "20240501"
     quant_backtest_fast_window: int = 5
@@ -348,8 +359,12 @@ class Config:
     # === 系统配置 ===
     max_workers: int = 3  # 低并发防封禁
     debug: bool = False
-    http_proxy: Optional[str] = None  # HTTP 代理 (例如: http://127.0.0.1:10809)
-    https_proxy: Optional[str] = None # HTTPS 代理
+    debug_print_prompt: bool = False
+    use_proxy: bool = False  # 是否启用代理（仅从 .env 加载）
+    proxy_host: str = "127.0.0.1"
+    proxy_port: int = 10809
+    http_proxy: Optional[str] = None  # 构造后的代理 URL (http://host:port)
+    https_proxy: Optional[str] = None
     
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
@@ -383,7 +398,7 @@ class Config:
     # Per-operation data source priorities. Empty values fall back to fetcher priority.
     daily_data_source_priority: str = ""
     stock_name_source_priority: str = "local,realtime,tushare,akshare,efinance,pytdx,baostock,yfinance"
-    chip_distribution_source_priority: str = "tushare,akshare"
+    chip_distribution_source_priority: str = "instock,akshare,tushare"
     main_index_source_priority: str = "akshare,yfinance"
     market_stats_source_priority: str = "akshare"
     sector_ranking_source_priority: str = "akshare"
@@ -474,46 +489,36 @@ class Config:
         # 确保环境变量已加载
         setup_env()
 
-        # === 智能代理配置 (关键修复) ===
-        # 如果配置了代理，自动设置 NO_PROXY 以排除国内数据源，避免行情获取失败
-        http_proxy = os.getenv('HTTP_PROXY') or os.getenv('http_proxy')
-        if http_proxy:
-            # 国内金融数据源域名列表
-            domestic_domains = [
-                'eastmoney.com',   # 东方财富 (Efinance/Akshare)
-                'sina.com.cn',     # 新浪财经 (Akshare)
-                '163.com',         # 网易财经 (Akshare)
-                'tushare.pro',     # Tushare
-                'baostock.com',    # Baostock
-                'sse.com.cn',      # 上交所
-                'szse.cn',         # 深交所
-                'csindex.com.cn',  # 中证指数
-                'cninfo.com.cn',   # 巨潮资讯
-                'localhost',
-                '127.0.0.1'
-            ]
+        # === 代理配置 ===
+        # 全部从 .env 加载，不与系统环境变量耦合
+        use_proxy = os.getenv('USE_PROXY', 'false').lower() == 'true'
+        proxy_host = os.getenv('PROXY_HOST', '127.0.0.1')
+        proxy_port = os.getenv('PROXY_PORT', '10809')
+        proxy_url = f'http://{proxy_host}:{proxy_port}' if use_proxy else None
 
-            # 获取现有的 no_proxy
-            current_no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
-            existing_domains = current_no_proxy.split(',') if current_no_proxy else []
+        if proxy_url:
+            os.environ['HTTP_PROXY'] = proxy_url
+            os.environ['http_proxy'] = proxy_url
+            os.environ['HTTPS_PROXY'] = proxy_url
+            os.environ['https_proxy'] = proxy_url
 
-            # 合并去重
-            final_domains = list(set(existing_domains + domestic_domains))
-            final_no_proxy = ','.join(filter(None, final_domains))
-
-            # 设置环境变量 (requests/urllib3/aiohttp 都会遵守此设置)
-            os.environ['NO_PROXY'] = final_no_proxy
-            os.environ['no_proxy'] = final_no_proxy
-
-            # 确保 HTTP_PROXY 也被正确设置（以防仅在 .env 中定义但未导出）
-            os.environ['HTTP_PROXY'] = http_proxy
-            os.environ['http_proxy'] = http_proxy
-
-            # HTTPS_PROXY 同理
-            https_proxy = os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')
-            if https_proxy:
-                os.environ['HTTPS_PROXY'] = https_proxy
-                os.environ['https_proxy'] = https_proxy
+        # 国内金融数据源域名始终绕开代理
+        domestic_domains = [
+            'eastmoney.com',   # 东方财富 (Efinance/Akshare)
+            'sina.com.cn',     # 新浪财经 (Akshare)
+            '163.com',         # 网易财经 (Akshare)
+            'tushare.pro',     # Tushare
+            'baostock.com',    # Baostock
+            'sse.com.cn',      # 上交所
+            'szse.cn',         # 深交所
+            'csindex.com.cn',  # 中证指数
+            'cninfo.com.cn',   # 巨潮资讯
+            'localhost',
+            '127.0.0.1',
+        ]
+        final_no_proxy = ','.join(domestic_domains)
+        os.environ['NO_PROXY'] = final_no_proxy
+        os.environ['no_proxy'] = final_no_proxy
 
         
         # 解析自选股列表（逗号分隔，统一为大写 Issue #355）
@@ -819,7 +824,10 @@ class Config:
             quant_backtest_use_stock_list=os.getenv('QUANT_BACKTEST_USE_STOCK_LIST', 'true').lower() == 'true',
             quant_backtest_stock_pool_path=os.getenv('QUANT_BACKTEST_STOCK_POOL_PATH', 'stock_pool.txt'),
             quant_backtest_stale_hours=int(os.getenv('QUANT_BACKTEST_STALE_HOURS', '24')),
-            quant_backtest_lookback_years=int(os.getenv('QUANT_BACKTEST_LOOKBACK_YEARS', '0')),
+            quant_backtest_lookback_months=int(
+                os.getenv('QUANT_BACKTEST_LOOKBACK_MONTHS',
+                          os.getenv('QUANT_BACKTEST_LOOKBACK_YEARS', '0'))
+            ),
             quant_backtest_start_date=os.getenv('QUANT_BACKTEST_START_DATE', '20200101'),
             quant_backtest_end_date=os.getenv('QUANT_BACKTEST_END_DATE', '20240501'),
             quant_backtest_fast_window=int(os.getenv('QUANT_BACKTEST_FAST_WINDOW', '5')),
@@ -850,13 +858,17 @@ class Config:
                 'DECISION_REPORT_OUTPUT_PATH',
                 'reports/daily_decision_report.md',
             ),
+            debug_print_prompt=os.getenv('DEBUG_PRINT_PROMPT', 'false').lower() == 'true',
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=int(os.getenv('MAX_WORKERS', '3')),
             debug=os.getenv('DEBUG', 'false').lower() == 'true',
             config_validate_mode=os.getenv('CONFIG_VALIDATE_MODE', 'warn').lower(),
-            http_proxy=os.getenv('HTTP_PROXY'),
-            https_proxy=os.getenv('HTTPS_PROXY'),
+            use_proxy=proxy_url is not None,
+            proxy_host=proxy_host,
+            proxy_port=int(proxy_port),
+            http_proxy=proxy_url,
+            https_proxy=proxy_url,
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             schedule_run_immediately=os.getenv('SCHEDULE_RUN_IMMEDIATELY', 'true').lower() == 'true',
@@ -912,7 +924,7 @@ class Config:
                 'STOCK_NAME_SOURCE_PRIORITY',
                 'local,realtime,tushare,akshare,efinance,pytdx,baostock,yfinance',
             ),
-            chip_distribution_source_priority=os.getenv('CHIP_DISTRIBUTION_SOURCE_PRIORITY', 'tushare,akshare'),
+            chip_distribution_source_priority=os.getenv('CHIP_DISTRIBUTION_SOURCE_PRIORITY', 'instock,akshare,tushare'),
             main_index_source_priority=os.getenv('MAIN_INDEX_SOURCE_PRIORITY', 'akshare,yfinance'),
             market_stats_source_priority=os.getenv('MARKET_STATS_SOURCE_PRIORITY', 'akshare'),
             sector_ranking_source_priority=os.getenv('SECTOR_RANKING_SOURCE_PRIORITY', 'akshare'),
@@ -1423,16 +1435,15 @@ class Config:
         return f"sqlite:///{db_path.absolute()}"
 
     def resolve_quant_backtest_dates(self, today: Optional[date] = None) -> tuple[str, str]:
-        """Resolve quant backtest dates from lookback years or static env dates."""
-        lookback_years = int(getattr(self, 'quant_backtest_lookback_years', 0) or 0)
-        if lookback_years <= 0:
+        """Resolve quant backtest dates from lookback months or static env dates."""
+        lookback_months = int(getattr(self, 'quant_backtest_lookback_months', 0) or 0)
+        if lookback_months <= 0:
             return self.quant_backtest_start_date, self.quant_backtest_end_date
 
+        from dateutil.relativedelta import relativedelta
+
         end_date = today or date.today()
-        try:
-            start_date = end_date.replace(year=end_date.year - lookback_years)
-        except ValueError:
-            start_date = end_date.replace(month=2, day=28, year=end_date.year - lookback_years)
+        start_date = end_date - relativedelta(months=lookback_months)
         return start_date.strftime('%Y%m%d'), end_date.strftime('%Y%m%d')
 
     def resolve_quant_stock_pool_items(self) -> list[dict[str, str | None]]:

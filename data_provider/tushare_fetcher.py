@@ -108,6 +108,7 @@ class TushareFetcher(BaseFetcher):
         # error (e.g. "频率超限", "今天访问次数已达上限"), skip this fetcher for
         # the rest of the run instead of wasting a call per stock.
         self._quota_exhausted_until: float = 0.0
+        self._cyq_permission_denied = False
 
         # 尝试初始化 API
         self._init_api()
@@ -475,8 +476,15 @@ class TushareFetcher(BaseFetcher):
                 return name
             
         except Exception as e:
-            logger.warning(f"Tushare 获取股票名称失败 {stock_code}: {e}")
-        
+            error_msg = str(e)
+            if any(keyword in error_msg for keyword in ['频率超限', '超限', '已达上限', '访问次数']):
+                self._quota_exhausted_until = time.time() + 3600
+                logger.warning(
+                    f"Tushare stock_basic 频率超限，跳过后续股票名称查询 1h: {e}"
+                )
+            else:
+                logger.warning(f"Tushare 获取股票名称失败 {stock_code}: {e}")
+
         return None
     
     def get_stock_list(self) -> Optional[pd.DataFrame]:
@@ -540,6 +548,9 @@ class TushareFetcher(BaseFetcher):
         """Get chip distribution from Tushare cyq_perf when account permissions allow it."""
         if self._api is None:
             return None
+        if self._cyq_permission_denied:
+            logger.debug(f"[Tushare] cyq_perf unavailable for this account, skip {stock_code}")
+            return None
         if _is_us_code(stock_code) or _is_etf_code(stock_code):
             return None
 
@@ -589,7 +600,14 @@ class TushareFetcher(BaseFetcher):
             )
             return chip
         except Exception as e:
-            logger.warning(f"[Tushare] cyq_perf 获取筹码分布失败 {stock_code}: {e}")
+            message = str(e)
+            if "没有接口(cyq_perf)访问权限" in message or (
+                "cyq_perf" in message and "访问权限" in message
+            ):
+                self._cyq_permission_denied = True
+                logger.debug(f"[Tushare] cyq_perf 无访问权限，跳过后续 Tushare 筹码请求: {e}")
+            else:
+                logger.warning(f"[Tushare] cyq_perf 获取筹码分布失败 {stock_code}: {e}")
             return None
 
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
